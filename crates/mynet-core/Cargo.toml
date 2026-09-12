@@ -5,10 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Shared constants, paths, and types for mynet"
+description = "Shared constants, paths, and trusted-peer config for mynet"
 
 [dependencies]
 dirs = { workspace = true }
+mynet-identity = { path = "../mynet-identity" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
 
 # rustc 1.75 cannot parse edition-2024 manifests. These pins keep the
 # workspace lockfile on crates this Cargo can download and compile.
@@ -40,3 +44,6 @@ syn = { workspace = true }
 thiserror-impl = { workspace = true }
 tracing-attributes = { workspace = true }
 tracing-core = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

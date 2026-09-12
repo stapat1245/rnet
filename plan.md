@@ -10,15 +10,13 @@ This is not a Tailscale clone. Cryptography is not invented here. Encryption is 
 
 ## Current Status
 
-**Phase 0 COMPLETE. Phase 1 COMPLETE.** Next: Phase 2 (local trusted-peer model).
+**Phase 0–2 COMPLETE.** Next: Phase 3 (TUN), which needs `/dev/net/tun` and `CAP_NET_ADMIN` and is not verified in this environment.
 
-Verified 2026-09-13 on this machine:
+Verified 2026-09-13:
 
-* `RUSTFLAGS="-D warnings" cargo test --workspace` — 24 tests passed, no warnings
-* `mynet --help`, `mynet version`, `mynet --version` exit 0
-* `mynet init` then `mynet identity` round-trip; second `init` without `--force` fails
-* Two config directories produce different public keys
-* Identity file mode is `0600`; private key is not printed
+* `RUSTFLAGS="-D warnings" cargo test --workspace` — 35 tests passed, no warnings
+* Identity: `init` / `identity`, file mode `0600`, private key not printed
+* Peers: `peer add|list|remove` on two config dirs; duplicate public key rejected; overlay IP must be in `10.42.0.0/24`; cannot add own public key
 
 Platform: Ubuntu 24.04.4 LTS, kernel 7.0.0-31-generic, `rustc 1.75.0` from the distro (no rustup). `wireguard-tools` 1.0.20210914 and in-tree `wireguard.ko` 1.0.0 are present. Host `/dev/net/tun` exists (`crw-rw-rw-`). Opening it as uid 1000 succeeded; `ip tuntap add` failed with `ioctl(TUNSETIFF): Operation not permitted` (no `CAP_NET_ADMIN`; `sudo -n` needs a password). Phase 3 cannot create an interface in this session.
 
@@ -165,7 +163,7 @@ Identity is local only. No network, no peer trust yet. Peer ID is a SHA-256 fing
 
 ## Phase 2
 
-**Status:** NOT STARTED
+**Status:** COMPLETE
 
 ### Objective
 
@@ -179,29 +177,43 @@ Phase 1 complete.
 
 ### Implementation tasks
 
-- [ ] `Peer`, `PeerId`, `PeerState` types
-- [ ] Persist trusted peers in `peers.toml`
-- [ ] CLI add/list/remove
-- [ ] Document what “trusted” means
+- [x] `Peer`, `PeerId`, `PeerState` types
+- [x] Persist trusted peers in `peers.toml` (mode `0600`)
+- [x] CLI add/list/remove
+- [x] Document what “trusted” means
 
 ### Tests
 
 * Add/list/remove round trip
-* Reject duplicate peer IDs / public keys
-* Reject invalid public keys and IPv4 addresses
-* Endpoint parse errors
+* Reject duplicate public keys and overlay IPs
+* Reject invalid public keys and off-overlay IPv4
+* Endpoint parse (IPv4 only)
+* CLI: cannot add own public key; empty list message
+
+`cargo test --workspace` after this phase: 35 passed.
 
 ### Manual verification
 
-Add a fake peer by public key and virtual IP; list it; remove it.
+Ran on this host with two temp config dirs:
+
+```text
+Trusted peer bob
+  Peer ID:    bd91cd3f95e9af23c7c0ef787c3853b6
+  Public Key: FWcusZBYIpUoYWluaHfojFhdB8Dgyik8rXPI4xQbG1E=
+  IP:         10.42.0.2
+  Endpoint:   192.0.2.10:51820
+  State:      disconnected
+```
+
+`peer remove bob` left `No trusted peers.` Adding the local public key failed with `refusing to add this node's own public key`.
 
 ### Exit criteria
 
-A node can store and display a trusted peer without talking to the network.
+A node can store and display a trusted peer without talking to the network. **Met.**
 
 ### Known limitations
 
-No handshake. Storing a public key is a trust decision, not authentication of live traffic.
+No handshake. Storing a public key is a trust decision, not authentication of live traffic. `PeerState` is always `disconnected` until Phase 11. Overlay addresses must be in `10.42.0.0/24`.
 
 ## Phase 3
 

@@ -1,23 +1,27 @@
-//! Shared constants and local paths for mynet.
-//!
-//! This crate is the control-plane foundation: names, overlay defaults, and
-//! where the node stores local state. It does not move VPN packets.
+//! Shared constants, paths, and the local trusted-peer set.
 //!
 //! Keep these layers distinct. Do not collapse them into one concept:
 //!
-//! - **Identity** — who is this peer? (public key / peer ID)
+//! - **Identity** — who is this peer? (`mynet-identity`, public key / peer ID)
 //! - **Discovery** — where is the peer reachable? (UDP endpoint)
 //! - **NAT traversal** — can two peers reach each other directly?
 //! - **Transport** — how do encrypted packets move? (UDP)
 //! - **Virtual networking** — how Linux traffic enters the overlay (TUN)
 //! - **Encryption** — how payloads are protected (kernel WireGuard)
+//!
+//! This crate is control-plane support. VPN packets must never be routed
+//! through a coordination server.
 
 use std::path::{Path, PathBuf};
+
+mod peer;
+
+pub use peer::{parse_endpoint, Peer, PeerError, PeerList, PeerState};
 
 /// CLI and package name.
 pub const APP_NAME: &str = "mynet";
 
-/// Package version from Cargo.toml.
+/// Package version (from Cargo.toml).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Default Linux TUN / WireGuard interface name.
@@ -29,7 +33,7 @@ pub const DEFAULT_OVERLAY_PREFIX: &str = "10.42.0.0/24";
 /// Default listen/transport port for later UDP / WireGuard phases.
 pub const DEFAULT_LISTEN_PORT: u16 = 51820;
 
-/// Environment override for the config directory. Used by tests.
+/// Environment override for the config directory. Used by tests and `--config-dir`.
 pub const CONFIG_DIR_ENV: &str = "MYNET_CONFIG_DIR";
 
 /// Directory for local configuration and identity.
@@ -59,9 +63,14 @@ pub fn identity_path_in(dir: &Path) -> PathBuf {
     dir.join("identity.toml")
 }
 
-/// Path of the trusted-peer list (Phase 2).
+/// Path of the trusted-peer list.
 pub fn peers_path() -> PathBuf {
-    config_dir().join("peers.toml")
+    peers_path_in(&config_dir())
+}
+
+/// Trusted-peer file inside an explicit config directory.
+pub fn peers_path_in(dir: &Path) -> PathBuf {
+    dir.join("peers.toml")
 }
 
 #[cfg(test)]
@@ -80,6 +89,7 @@ mod tests {
         assert_eq!(identity_path(), dir.join("identity.toml"));
         assert_eq!(peers_path(), dir.join("peers.toml"));
         assert_eq!(identity_path_in(&dir), dir.join("identity.toml"));
+        assert_eq!(peers_path_in(&dir), dir.join("peers.toml"));
     }
 
     #[test]

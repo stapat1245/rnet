@@ -31,9 +31,11 @@ fn help_exits_zero_and_lists_version() {
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let stdout = stdout(&output);
     assert!(stdout.contains("Usage:"), "unexpected help:\n{stdout}");
+    assert!(stdout.contains("peer"));
     assert!(stdout.contains("version"));
     assert!(stdout.contains("init"));
     assert!(stdout.contains("identity"));
+    assert!(stdout.contains("peer"));
 }
 
 #[test]
@@ -137,4 +139,82 @@ fn malformed_identity_file_fails_cleanly() {
     assert!(!shown.status.success());
     let err = format!("{}{}", stdout(&shown), stderr(&shown));
     assert!(err.contains("malformed"), "{err}");
+}
+
+#[test]
+fn peer_add_list_remove() {
+    let alice = tempfile::tempdir().unwrap();
+    let bob = tempfile::tempdir().unwrap();
+    assert!(run_in(alice.path(), &["init"]).status.success());
+    assert!(run_in(bob.path(), &["init"]).status.success());
+    let bob_pk = extract_line(&stdout(&run_in(bob.path(), &["identity"])), "Public Key:").to_string();
+
+    let add = run_in(
+        alice.path(),
+        &[
+            "peer",
+            "add",
+            "--public-key",
+            &bob_pk,
+            "--ip",
+            "10.42.0.2",
+            "--endpoint",
+            "192.0.2.10:51820",
+            "--name",
+            "bob",
+        ],
+    );
+    assert!(add.status.success(), "stderr: {}", stderr(&add));
+    let listed = run_in(alice.path(), &["peer", "list"]);
+    assert!(listed.status.success(), "stderr: {}", stderr(&listed));
+    let listed_out = stdout(&listed);
+    assert!(listed_out.contains("bob"));
+    assert!(listed_out.contains("10.42.0.2"));
+    assert!(listed_out.contains("192.0.2.10:51820"));
+    assert!(listed_out.contains("disconnected"));
+    assert!(listed_out.contains(&bob_pk));
+
+    let dup = run_in(
+        alice.path(),
+        &["peer", "add", "--public-key", &bob_pk, "--ip", "10.42.0.3"],
+    );
+    assert!(!dup.status.success());
+
+    let charlie = tempfile::tempdir().unwrap();
+    assert!(run_in(charlie.path(), &["init"]).status.success());
+    let charlie_pk =
+        extract_line(&stdout(&run_in(charlie.path(), &["identity"])), "Public Key:").to_string();
+    let bad_ip = run_in(
+        alice.path(),
+        &[
+            "peer",
+            "add",
+            "--public-key",
+            &charlie_pk,
+            "--ip",
+            "8.8.8.8",
+        ],
+    );
+    assert!(!bad_ip.status.success());
+    let err = format!("{}{}", stdout(&bad_ip), stderr(&bad_ip));
+    assert!(err.contains("10.42.0.0/24") || err.contains("overlay"), "{err}");
+
+    let removed = run_in(alice.path(), &["peer", "remove", "bob"]);
+    assert!(removed.status.success(), "stderr: {}", stderr(&removed));
+    let empty = run_in(alice.path(), &["peer", "list"]);
+    assert!(stdout(&empty).contains("No trusted peers"));
+}
+
+#[test]
+fn peer_cannot_add_self() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(run_in(dir.path(), &["init"]).status.success());
+    let pk = extract_line(&stdout(&run_in(dir.path(), &["identity"])), "Public Key:").to_string();
+    let add = run_in(
+        dir.path(),
+        &["peer", "add", "--public-key", &pk, "--ip", "10.42.0.1"],
+    );
+    assert!(!add.status.success());
+    let err = format!("{}{}", stdout(&add), stderr(&add));
+    assert!(err.contains("own public key"), "{err}");
 }

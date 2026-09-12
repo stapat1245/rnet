@@ -23,7 +23,7 @@ See [`plan.md`](plan.md) for the living implementation plan.
 | --- | --- | --- |
 | 0 | Architecture and repository setup | COMPLETE |
 | 1 | Identity | COMPLETE |
-| 2 | Peer model | NOT STARTED |
+| 2 | Peer model | COMPLETE |
 | 3–16 | TUN, encrypted transport, coordination, NAT, relay | NOT STARTED |
 
 ## Requirements
@@ -43,22 +43,18 @@ cargo run -p mynet-cli -- version
 ```
 
 ```bash
-mynet init
-mynet identity
-```
-
-After install (or `cargo run -p mynet-cli --`):
-
-```bash
 mynet --help
 mynet version
 mynet init
 mynet identity
+mynet peer add --public-key <base64> --ip 10.42.0.2 [--endpoint HOST:PORT] [--name bob]
+mynet peer list
+mynet peer remove bob
 ```
 
 `mynet identity` prints the peer ID and public key. It never prints the private key.
 
-Config lives in `$MYNET_CONFIG_DIR` or `$XDG_CONFIG_HOME/mynet` (`identity.toml`, mode `0600`).
+Config lives in `$MYNET_CONFIG_DIR` or `$XDG_CONFIG_HOME/mynet` (`identity.toml` and `peers.toml`, mode `0600`).
 
 ## Architecture in one picture
 

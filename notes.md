@@ -100,7 +100,7 @@ Allowed IPs will map overlay addresses (for example `10.42.0.2/32`) onto a peer 
 
 ## Key Management
 
-Phase 1 design (implemented in that phase, recorded here so it is not reinvented):
+Phase 1 (implemented):
 
 * Algorithm: X25519 via `x25519-dalek` 2.0.1 (`static_secrets`, `getrandom`). No custom scalar arithmetic.
 * Public key encoding: standard WireGuard base64 (32 bytes → 44-character base64).
@@ -110,6 +110,20 @@ Phase 1 design (implemented in that phase, recorded here so it is not reinvented
 * File mode `0600`, directory mode `0700`. Refuse to load a group/world-readable identity file.
 * `mynet identity` prints peer ID and public key only.
 * Private key is never logged, never sent to peers, never sent to a coordinator.
+
+## Trusted peers
+
+**Trusted** means the operator ran `mynet peer add` with that public key. It is a local authorization entry in `peers.toml` (mode `0600`).
+
+It is **not**:
+
+* proof the remote host holds the private key (that is WireGuard, Phase 5/7)
+* trust of a UDP endpoint, hostname, or nickname
+* permission for an unknown key that merely claims the same overlay IP
+
+Duplicate public keys and duplicate overlay IPs are rejected. Overlay IPs must be in `10.42.0.0/24` excluding `.0` and `.255`. IPv6 endpoints are rejected. Adding this node's own public key is refused.
+
+`PeerState` is stored only in memory as `disconnected` for now. The enum includes later states (`discovering`, `connecting`, `direct`, `relaying`, `failed`) so Phase 11 does not invent a second type.
 
 ## Routing
 
@@ -160,7 +174,8 @@ cargo run -p mynet-cli -- version
 
 # Phase 1 identity (isolated config dir)
 cargo run -p mynet-cli -- --config-dir /tmp/mynet-a init
-cargo run -p mynet-cli -- --config-dir /tmp/mynet-a identity
+cargo run -p mynet-cli -- --config-dir /tmp/mynet-a peer add --public-key "$BOB_PUB" --ip 10.42.0.2 --name bob
+cargo run -p mynet-cli -- --config-dir /tmp/mynet-a peer list
 
 # Environment
 uname -a
@@ -183,6 +198,7 @@ ls -l /dev/net/tun
 | `mynet init` then `mynet identity` | Same peer ID / public key; private key not printed; file mode 600 |
 | Second `mynet init` without `--force` | Exit 1, message mentions `--force` |
 | Two `--config-dir` trees | Distinct public keys |
+| `mynet peer add/list/remove` | Round-trip; duplicate key rejected; `8.8.8.8` rejected |
 
 ## Known Problems
 

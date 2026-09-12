@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mynet-cli",
+    "crates/mynet-core",
+    "crates/mynet-identity",
+]
+default-members = ["crates/mynet-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+publish = false
+
+# Direct dependencies plus exact transitive pins.
+# System rustc is 1.75.0 (no rustup). Current crates.io releases often
+# require edition 2024, which this Cargo cannot parse. Do not loosen pins
+# without compiling on this toolchain.
+[workspace.dependencies]
+anyhow = "=1.0.86"
+base64 = "=0.21.7"
+clap = { version = "=4.4.18", features = ["derive", "env"] }
+dirs = "=5.0.1"
+hex = "=0.4.3"
+serde = { version = "=1.0.203", features = ["derive"] }
+sha2 = "=0.10.8"
+tempfile = "=3.10.1"
+thiserror = "=1.0.63"
+toml = "=0.5.11"
+tracing = "=0.1.40"
+tracing-subscriber = { version = "=0.3.18", features = ["env-filter"] }
+x25519-dalek = { version = "=2.0.1", default-features = false, features = ["static_secrets", "getrandom", "precomputed-tables"] }
+zeroize = { version = "=1.7.0", default-features = false, features = ["alloc"] }
+
+# Transitive pins that otherwise float onto edition-2024 crates.
+aho-corasick = "=1.1.3"
+bitflags = "=2.6.0"
+cfg-if = "=1.0.0"
+clap_builder = "=4.4.18"
+clap_derive = "=4.4.7"
+errno = "=0.3.9"
+fastrand = "=2.1.0"
+getrandom = "=0.2.15"
+hashbrown = { version = "=0.14.5", default-features = false }
+indexmap = "=2.2.6"
+libc = "=0.2.155"
+linux-raw-sys = "=0.4.14"
+log = "=0.4.22"
+memchr = "=2.7.4"
+once_cell = "=1.19.0"
+proc-macro2 = "=1.0.86"
+quote = "=1.0.36"
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
+regex-automata = "=0.4.7"
+regex-syntax = "=0.8.4"
+rustix = "=0.38.34"
+serde_derive = "=1.0.203"
+smallvec = "=1.13.2"
+syn = "=2.0.72"
+thiserror-impl = "=1.0.63"
+tracing-attributes = "=0.1.27"
+tracing-core = "=0.1.32"

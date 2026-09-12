@@ -1,0 +1,23 @@
+[package]
+name = "mynet-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Command-line interface for the mynet P2P VPN"
+
+[[bin]]
+name = "mynet"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+mynet-core = { path = "../mynet-core" }
+mynet-identity = { path = "../mynet-identity" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

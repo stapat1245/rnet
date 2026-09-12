@@ -1,0 +1,42 @@
+[package]
+name = "mynet-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Shared constants, paths, and types for mynet"
+
+[dependencies]
+dirs = { workspace = true }
+
+# rustc 1.75 cannot parse edition-2024 manifests. These pins keep the
+# workspace lockfile on crates this Cargo can download and compile.
+# They are not part of the public API.
+aho-corasick = { workspace = true }
+bitflags = { workspace = true }
+cfg-if = { workspace = true }
+clap_builder = { workspace = true }
+clap_derive = { workspace = true }
+errno = { workspace = true }
+fastrand = { workspace = true }
+getrandom = { workspace = true }
+hashbrown = { workspace = true }
+indexmap = { workspace = true }
+libc = { workspace = true }
+linux-raw-sys = { workspace = true }
+log = { workspace = true }
+memchr = { workspace = true }
+once_cell = { workspace = true }
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+rand_core = { workspace = true }
+regex-automata = { workspace = true }
+regex-syntax = { workspace = true }
+rustix = { workspace = true }
+serde_derive = { workspace = true }
+smallvec = { workspace = true }
+syn = { workspace = true }
+thiserror-impl = { workspace = true }
+tracing-attributes = { workspace = true }
+tracing-core = { workspace = true }

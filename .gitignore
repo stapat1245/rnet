@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local secrets — never commit identity or key material
+identity.toml
+*.key
+.env
+.env.*
+!/.env.example

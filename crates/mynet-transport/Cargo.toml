@@ -1,0 +1,17 @@
+[package]
+name = "mynet-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "UDP transport and experimental plaintext overlay forwarding"
+
+[dependencies]
+libc = { workspace = true }
+mynet-vpn = { path = "../mynet-vpn" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+mynet-vpn = { path = "../mynet-vpn" }

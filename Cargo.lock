@@ -352,9 +352,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "mynet-core",
  "mynet-identity",
+ "mynet-transport",
+ "mynet-vpn",
+ "serde",
  "tempfile",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -410,6 +415,29 @@ dependencies = [
  "thiserror",
  "toml",
  "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "mynet-transport"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "mynet-vpn",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "mynet-vpn"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "libc",
+ "mynet-core",
+ "tempfile",
+ "thiserror",
+ "tracing",
  "zeroize",
 ]
 

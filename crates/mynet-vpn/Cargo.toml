@@ -1,0 +1,19 @@
+[package]
+name = "mynet-vpn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Linux TUN and kernel WireGuard interface control for mynet"
+
+[dependencies]
+base64 = { workspace = true }
+libc = { workspace = true }
+mynet-core = { path = "../mynet-core" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -24,7 +24,11 @@ See [`plan.md`](plan.md) for the living implementation plan.
 | 0 | Architecture and repository setup | COMPLETE |
 | 1 | Identity | COMPLETE |
 | 2 | Peer model | COMPLETE |
-| 3–16 | TUN, encrypted transport, coordination, NAT, relay | NOT STARTED |
+| 3 | TUN interface | IMPLEMENTED (needs sudo to verify) |
+| 4 | Two-host TUN+UDP | IMPLEMENTED (`--plain`, needs sudo) |
+| 5 | Kernel WireGuard | IMPLEMENTED (`mynet connect`, needs sudo) |
+| 6 | Manual peer exchange | COMPLETE (`export` / `peer import`) |
+| 7–16 | Handshake hardening, coordinator, NAT, relay | NOT STARTED |
 
 ## Requirements
 
@@ -50,6 +54,11 @@ mynet identity
 mynet peer add --public-key <base64> --ip 10.42.0.2 [--endpoint HOST:PORT] [--name bob]
 mynet peer list
 mynet peer remove bob
+mynet export --ip 10.42.0.1 --endpoint HOST:PORT
+mynet peer import alice.toml --name alice
+sudo mynet tun-test --ip 10.42.0.1 --duration 0
+sudo mynet connect --ip 10.42.0.1
+sudo mynet disconnect
 ```
 
 `mynet identity` prints the peer ID and public key. It never prints the private key.

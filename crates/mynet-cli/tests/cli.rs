@@ -36,6 +36,9 @@ fn help_exits_zero_and_lists_version() {
     assert!(stdout.contains("init"));
     assert!(stdout.contains("identity"));
     assert!(stdout.contains("peer"));
+    assert!(stdout.contains("connect"));
+    assert!(stdout.contains("tun-test"));
+    assert!(stdout.contains("export"));
 }
 
 #[test]
@@ -217,4 +220,54 @@ fn peer_cannot_add_self() {
     assert!(!add.status.success());
     let err = format!("{}{}", stdout(&add), stderr(&add));
     assert!(err.contains("own public key"), "{err}");
+}
+
+#[test]
+fn export_then_peer_import() {
+    let alice = tempfile::tempdir().unwrap();
+    let bob = tempfile::tempdir().unwrap();
+    assert!(run_in(alice.path(), &["init"]).status.success());
+    let export = run_in(
+        alice.path(),
+        &["export", "--ip", "10.42.0.1", "--endpoint", "192.0.2.10:51820"],
+    );
+    assert!(export.status.success(), "stderr: {}", stderr(&export));
+    let body = stdout(&export);
+    assert!(body.contains("public_key"));
+    assert!(body.contains("10.42.0.1"));
+    assert!(!body.to_lowercase().contains("private_key"));
+
+    let rec = alice.path().join("alice.toml");
+    fs::write(&rec, &body).unwrap();
+    assert!(run_in(bob.path(), &["init"]).status.success());
+    let imported = run_in(
+        bob.path(),
+        &["peer", "import", rec.to_str().unwrap(), "--name", "alice"],
+    );
+    assert!(imported.status.success(), "stderr: {}", stderr(&imported));
+    let listed = stdout(&run_in(bob.path(), &["peer", "list"]));
+    assert!(listed.contains("alice"));
+    assert!(listed.contains("10.42.0.1"));
+    assert!(listed.contains("192.0.2.10:51820"));
+}
+
+#[test]
+fn tun_test_without_cap_fails_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_in(
+        dir.path(),
+        &["tun-test", "--ip", "10.42.0.1", "--interface", "mynettst0", "--duration", "0"],
+    );
+    if out.status.success() {
+        // Privileged environment created a real TUN; that is also a pass.
+        return;
+    }
+    let err = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(
+        err.contains("CAP_NET_ADMIN")
+            || err.contains("Permission")
+            || err.contains("/dev/net/tun")
+            || err.contains("No such file"),
+        "{err}"
+    );
 }

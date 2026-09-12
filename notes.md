@@ -71,7 +71,9 @@ $ ip tuntap add dev mynet-probe0 mode tun
 ioctl(TUNSETIFF): Operation not permitted
 ```
 
-`TUNSETIFF` needs `CAP_NET_ADMIN`. Current process capabilities are empty. `sudo -n` fails (`sudo: a password is required`). Phase 3 cannot be fully verified in this session.
+`TUNSETIFF` needs `CAP_NET_ADMIN`. Current process capabilities are empty. `sudo -n` fails (`sudo: a password is required`). Live TUN create was not verified after implementing `mynet tun-test`.
+
+Implementation (`mynet-vpn`): `IFF_TUN | IFF_NO_PI`, ioctl `TUNSETIFF` (`0x400454ca`), then `ip addr replace` + `ip link set up`. Closing the fd destroys a non-persistent TUN. `mynet tun-test --duration 0` configures and exits; `> 0` reads packets and prints proto/src/dst only (no payload).
 
 `/dev/net/tun` being world-writable is unusual and is a host hardening issue. It does **not** grant unprivileged interface creation.
 
@@ -96,7 +98,18 @@ The module is in-tree. Userspace tools are installed. Creating a WireGuard link 
 
 WireGuard identity is a Curve25519 keypair. Phase 1 generates that key type so Phase 5 can load the same file into `wg set`.
 
-Allowed IPs will map overlay addresses (for example `10.42.0.2/32`) onto a peer public key. Endpoint is discovery data, not identity.
+Phase 5 (`mynet connect`) runs:
+
+```text
+ip link add dev mynet0 type wireguard
+wg set mynet0 listen-port 51820 private-key <0600 tempfile> peer <pk> allowed-ips 10.42.0.2/32 endpoint host:port persistent-keepalive 25
+ip addr replace 10.42.0.1/24 dev mynet0
+ip link set mynet0 up
+```
+
+The private key tempfile is deleted after `wg set`. Allowed IPs are cryptokey routing (`/32` per peer). Endpoint is discovery data, not identity.
+
+`mynet connect --plain` does **not** use WireGuard. It wraps raw IPv4 in a `MYN1` UDP datagram. That path is for learning TUN/UDP only.
 
 ## Key Management
 
@@ -131,7 +144,21 @@ Not implemented. Target: `10.42.0.0/24 dev mynet0`. Install on connect, remove o
 
 ## UDP Notes
 
-Not implemented. Standard `std`/`tokio` UDP sockets on Linux. Default port `51820` (WireGuard convention). Bind `0.0.0.0:51820` unless configured. IPv4 only.
+Phase 4 (`mynet connect --plain`) binds `0.0.0.0:<listen_port>` (default 51820) and forwards:
+
+```text
+TUN IPv4  →  UDP datagram  [MYN1 | ipv4]
+UDP datagram → TUN IPv4
+```
+
+Outbound: source must be this node's overlay IP; dest must be a trusted peer with an endpoint. Inbound: dest must be local overlay IP; source must be a trusted overlay IP. This is **not** authentication. Anyone who can send UDP can forge those headers. Use WireGuard (`mynet connect` without `--plain`) for real traffic.
+
+Identity != discovery != transport != encryption:
+
+* Identity: X25519 public key
+* Discovery: current UDP endpoint in `peers.toml` / export `endpoint =`
+* Transport: UDP
+* Encryption: kernel WireGuard (or none on `--plain`)
 
 ## NAT Traversal Notes
 
@@ -177,6 +204,15 @@ cargo run -p mynet-cli -- --config-dir /tmp/mynet-a init
 cargo run -p mynet-cli -- --config-dir /tmp/mynet-a peer add --public-key "$BOB_PUB" --ip 10.42.0.2 --name bob
 cargo run -p mynet-cli -- --config-dir /tmp/mynet-a peer list
 
+# Phase 6 exchange
+cargo run -p mynet-cli -- --config-dir /tmp/mynet-a export --ip 10.42.0.1 --endpoint 192.0.2.10:51820
+cargo run -p mynet-cli -- --config-dir /tmp/mynet-b peer import /tmp/alice.toml --name alice
+
+# Phase 3 / 5 (root)
+sudo mynet tun-test --ip 10.42.0.1 --duration 0
+sudo mynet connect --ip 10.42.0.1
+sudo mynet disconnect
+
 # Environment
 uname -a
 rustc --version
@@ -200,7 +236,9 @@ ls -l /dev/net/tun
 | `cargo test --workspace` after Phase 2 | 35 passed, `RUSTFLAGS=-D warnings` clean |
 | `mynet peer add/list/remove` | Stores overlay IP + public key; state `disconnected`; file intended `0600` |
 | Add own public key | Exit 1, `refusing to add this node's own public key` |
-| `mynet peer add/list/remove` | Round-trip; duplicate key rejected; `8.8.8.8` rejected |
+| `cargo test --workspace` after Phase 6 | 51 passed, `-D warnings` clean |
+| `mynet tun-test` unprivileged | Fails with CAP_NET_ADMIN / no TUN node (expected) |
+| `mynet export` / `peer import` | Round-trip; no private key in export |
 
 ## Known Problems
 

@@ -10,13 +10,24 @@ This is not a Tailscale clone. Cryptography is not invented here. Encryption is 
 
 ## Current Status
 
-**Phase 0–2 COMPLETE.** Next: Phase 3 (TUN), which needs `/dev/net/tun` and `CAP_NET_ADMIN` and is not verified in this environment.
+**Phases 0–2 COMPLETE. Phases 3–6 implemented; live TUN/WireGuard not verified (no CAP_NET_ADMIN).**
 
-Verified 2026-09-13:
+`RUSTFLAGS="-D warnings" cargo test --workspace` on 2026-09-13: **51 tests passed**, no warnings.
 
-* `RUSTFLAGS="-D warnings" cargo test --workspace` — 35 tests passed, no warnings
-* Identity: `init` / `identity`, file mode `0600`, private key not printed
-* Peers: `peer add|list|remove` on two config dirs; duplicate public key rejected; overlay IP must be in `10.42.0.0/24`; cannot add own public key
+| Phase | Code | Privileged live path |
+| --- | --- | --- |
+| 3 TUN | `mynet tun-test` | Not run (`TUNSETIFF` EPERM / sandbox has no `/dev/net/tun`) |
+| 4 Plain UDP | `mynet connect --plain` | Logic tested; no two-TUN ping |
+| 5 WireGuard | `mynet connect` | `wg set` argv tested; `ip link add type wireguard` not executed |
+| 6 Manual exchange | `mynet export` / `peer import` | **Verified** in CLI tests |
+
+Run on a privileged host:
+
+```bash
+sudo mynet tun-test --ip 10.42.0.1 --duration 0
+# two machines after exchanging export files:
+sudo mynet connect --ip 10.42.0.1
+```
 
 Platform: Ubuntu 24.04.4 LTS, kernel 7.0.0-31-generic, `rustc 1.75.0` from the distro (no rustup). `wireguard-tools` 1.0.20210914 and in-tree `wireguard.ko` 1.0.0 are present. Host `/dev/net/tun` exists (`crw-rw-rw-`). Opening it as uid 1000 succeeded; `ip tuntap add` failed with `ioctl(TUNSETIFF): Operation not permitted` (no `CAP_NET_ADMIN`; `sudo -n` needs a password). Phase 3 cannot create an interface in this session.
 
@@ -47,8 +58,10 @@ mynet/
 ├── README.md
 └── crates/
     ├── mynet-cli/          clap binary (`mynet`)
-    ├── mynet-core/         shared constants and paths
-    └── mynet-identity/     X25519 identity (Phase 1)
+    ├── mynet-core/         shared constants, paths, peers, local overlay config
+    ├── mynet-identity/     X25519 identity
+    ├── mynet-vpn/          Linux TUN + kernel WireGuard (`ip`/`wg`)
+    └── mynet-transport/    UDP + experimental plaintext overlay framing
 ```
 
 Further crates (`mynet-vpn`, `mynet-transport`, `mynet-protocol`, `mynet-coordinator`) are added when a phase actually needs them. Empty crates are not created for decoration.
@@ -217,7 +230,7 @@ No handshake. Storing a public key is a trust decision, not authentication of li
 
 ## Phase 3
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED (privileged verification BLOCKED)
 
 ### Objective
 
@@ -225,80 +238,86 @@ Create a Linux TUN (`mynet0`), assign IPv4, bring it up, read/write packets, cle
 
 ### Prerequisites
 
-Phase 2. `CAP_NET_ADMIN` or root.
+Phase 2. `CAP_NET_ADMIN` or root for a live interface.
 
 ### Implementation tasks
 
-- [ ] Open `/dev/net/tun`, `TUNSETIFF`
-- [ ] Configure address `10.42.0.1/24` (or configured)
-- [ ] Bring link up
-- [ ] Read/write packet loop
-- [ ] `sudo mynet tun-test`
-- [ ] Cleanup on exit
+- [x] Open `/dev/net/tun`, `TUNSETIFF`
+- [x] Configure address via `ip addr replace …/24`
+- [x] Bring link up
+- [x] Read packets (`--duration > 0`)
+- [x] `mynet tun-test`
+- [x] Cleanup on process exit (non-persistent TUN)
 
 ### Tests
 
-* Packet buffer framing (unit)
-* Privileged integration if the environment allows
+* IPv4 header parse (unit) — pass
+* Bad interface names — pass
+* `tun-test` without capability fails with a clear error — pass
+* Live `TUNSETIFF` success — **not run**
 
 ### Manual verification
 
-```bash
-sudo mynet tun-test
-ip addr show mynet0
-ip link show mynet0
-ip route
-```
-
-Record output in `notes.md`.
+`sudo mynet tun-test --ip 10.42.0.1 --duration 0` was **not** executed. Unprivileged run failed as expected (CAP_NET_ADMIN / missing `/dev/net/tun` in sandbox).
 
 ### Exit criteria
 
-Linux treats `mynet0` as a real interface; the process can observe packets destined to it.
+Linux treats `mynet0` as a real interface — **not met in this environment**. Code path exists.
 
 ### Known limitations
 
-Unencrypted. No second host. Requires root.
+Unencrypted. Requires root. Interface goes away when `tun-test` exits.
 
 ## Phase 4
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED (two-host ping BLOCKED)
 
 ### Objective
 
-Two hosts exchange packets over TUN + UDP. Experimental forwarding may be plaintext, clearly labeled as not the final protocol.
+Two hosts exchange packets over TUN + UDP. Experimental forwarding is plaintext, labeled as not the final protocol.
 
 ### Prerequisites
 
-Phase 3 on two Linux machines, or two network namespaces, with direct UDP connectivity.
+Phase 3. Direct UDP connectivity.
 
 ### Implementation tasks
 
-- [ ] UDP bind/send/recv
-- [ ] Map virtual IP to endpoint
-- [ ] TUN → UDP → TUN forwarding
-- [ ] Document that this is insecure
+- [x] UDP bind/send/recv
+- [x] Map virtual IP to endpoint
+- [x] TUN → UDP → TUN loop (`MYN1` framing)
+- [x] Document that this is insecure (`--plain` warning)
 
 ### Tests
 
-* UDP framing
-* Namespace-based integration if possible
+* Frame encode/decode — pass
+* Outbound/inbound overlay IP policy — pass
+* Localhost UDP round-trip of a framed packet — pass (skipped if bind is denied)
+* Two real TUN devices + ping — **not run**
 
 ### Manual verification
 
-`ping 10.42.0.2` from Alice. TCP if practical.
+`mynet connect --plain` not run with privileges. Use two hosts:
+
+```bash
+# Alice
+sudo mynet connect --plain --ip 10.42.0.1 --listen-port 51820
+# Bob
+sudo mynet connect --plain --ip 10.42.0.2 --listen-port 51820
+```
+
+Peers must already have each other's public key, overlay IP, and UDP endpoint.
 
 ### Exit criteria
 
-Application packet from Alice reaches Bob's virtual interface; return traffic works.
+Application packet from Alice reaches Bob — **not met here**.
 
 ### Known limitations
 
-Not encrypted. Manual endpoints. No NAT.
+Not encrypted. Headers can be spoofed. Manual endpoints. No NAT.
 
 ## Phase 5
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED (live WireGuard BLOCKED)
 
 ### Objective
 
@@ -306,35 +325,42 @@ Replace experimental forwarding with kernel WireGuard. No plaintext VPN payload 
 
 ### Prerequisites
 
-Phase 4 path understood. Kernel WireGuard available.
+Kernel WireGuard + `wg`. `CAP_NET_ADMIN`.
 
 ### Implementation tasks
 
-- [ ] Create `wireguard` interface (or convert `mynet0`)
-- [ ] Load local private key
-- [ ] Configure peer public key, endpoint, allowed IPs
-- [ ] Verify with `tcpdump` that payload is not plaintext
+- [x] `ip link add type wireguard`
+- [x] Load local private key via a mode-0600 temp file, then delete it
+- [x] Configure peer public key, endpoint, allowed IPs `/32`, keepalive 25s
+- [ ] tcpdump proof of ciphertext — **not run**
 
 ### Tests
 
-* Config rendering / allowed-IP mapping
-* Privileged two-namespace test if possible
+* `wg set` argument construction (peer, allowed-ips, endpoint, keepalive) — pass
+* Privileged apply — **not run**
 
 ### Manual verification
 
-Ping plus `tcpdump` on the physical interface.
+```bash
+sudo mynet connect --ip 10.42.0.1
+# other host:
+sudo mynet connect --ip 10.42.0.2
+sudo tcpdump -ni wlp62s0 udp port 51820
+```
+
+Not executed here.
 
 ### Exit criteria
 
-Ping works; capture shows WireGuard, not ICMP plaintext, on the physical NIC.
+Ping works and capture is WireGuard — **not met here**.
 
 ### Known limitations
 
-Still manual endpoints. Linux only.
+Still manual endpoints. Linux only. `mynet connect` without `--plain` is this path.
 
 ## Phase 6
 
-**Status:** NOT STARTED
+**Status:** COMPLETE (exchange CLI). Encrypted ping still needs Phase 5 privileges.
 
 ### Objective
 
@@ -342,29 +368,29 @@ Fully decentralized first version: Alice and Bob manually exchange public keys, 
 
 ### Prerequisites
 
-Phase 5.
+Phase 1–2 (identity + trust). Connect uses Phase 5 when privileged.
 
 ### Implementation tasks
 
-- [ ] Document exchange procedure
-- [ ] CLI helpers to print/import peer records
-- [ ] Connect with only local config
+- [x] Document exchange procedure (`notes.md`, `mynet export` comments)
+- [x] `mynet export` / `mynet peer import`
+- [x] `mynet connect` uses only local identity + `peers.toml`
 
 ### Tests
 
-Import/export of a peer record.
+Export then import round-trip — pass. Private key not in export.
 
 ### Manual verification
 
-Two hosts, no coordinator, encrypted ping.
+CLI test `export_then_peer_import`. Two-host encrypted ping not run.
 
 ### Exit criteria
 
-Direct encrypted P2P from files exchanged out of band.
+Out-of-band exchange of peer records — **met**. Direct encrypted P2P ping — **not met** (needs root).
 
 ### Known limitations
 
-Endpoint changes require manual updates.
+Endpoint changes require re-export / `peer add` updates. Coordinator still absent (intentional).
 
 ## Phase 7
 

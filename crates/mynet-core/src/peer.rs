@@ -117,6 +117,14 @@ impl PeerList {
         &self.peers
     }
 
+    /// Overlay IP → UDP endpoint for peers that have an endpoint configured.
+    pub fn udp_routes(&self) -> Vec<(Ipv4Addr, SocketAddr)> {
+        self.peers
+            .iter()
+            .filter_map(|p| p.endpoint.map(|endpoint| (p.virtual_ip, endpoint)))
+            .collect()
+    }
+
     pub fn load_from(path: &Path) -> Result<Self, PeerError> {
         match fs::metadata(path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(PeerList::new()),

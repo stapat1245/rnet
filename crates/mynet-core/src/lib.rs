@@ -14,8 +14,10 @@
 
 use std::path::{Path, PathBuf};
 
+mod local;
 mod peer;
 
+pub use local::{LocalConfig, LocalError};
 pub use peer::{parse_endpoint, Peer, PeerError, PeerList, PeerState};
 
 /// CLI and package name.
@@ -73,6 +75,16 @@ pub fn peers_path_in(dir: &Path) -> PathBuf {
     dir.join("peers.toml")
 }
 
+/// Local overlay settings (virtual IP, listen port, interface name).
+pub fn local_path() -> PathBuf {
+    local_path_in(&config_dir())
+}
+
+/// Local overlay settings inside an explicit config directory.
+pub fn local_path_in(dir: &Path) -> PathBuf {
+    dir.join("local.toml")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +102,7 @@ mod tests {
         assert_eq!(peers_path(), dir.join("peers.toml"));
         assert_eq!(identity_path_in(&dir), dir.join("identity.toml"));
         assert_eq!(peers_path_in(&dir), dir.join("peers.toml"));
+        assert_eq!(local_path_in(&dir), dir.join("local.toml"));
     }
 
     #[test]

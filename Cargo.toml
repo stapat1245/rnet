@@ -4,6 +4,8 @@ members = [
     "crates/mynet-cli",
     "crates/mynet-core",
     "crates/mynet-identity",
+    "crates/mynet-transport",
+    "crates/mynet-vpn",
 ]
 default-members = ["crates/mynet-cli"]
 

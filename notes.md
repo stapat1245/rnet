@@ -143,7 +143,7 @@ Not started. Coordinator is optional, stores no VPN payload, and is not the data
 
 ## Security Model
 
-Trust is a public key that an operator explicitly adds. IP, hostname, and UDP endpoint are locators.
+Trust is a public key that an operator explicitly added with `mynet peer add`. That writes `peers.toml`. It is **not** a handshake. Live overlay traffic must still prove possession of the corresponding private key (WireGuard, Phase 5/7). IP, hostname, UDP endpoint, and nickname are locators or labels, never identity.
 
 WireGuard provides handshake authentication, replay protection, and forward secrecy for the data plane. mynet must not invent packet counters or nonces.
 
@@ -197,7 +197,9 @@ ls -l /dev/net/tun
 | `cargo test --workspace` after Phase 1 | 24 passed |
 | `mynet init` then `mynet identity` | Same peer ID / public key; private key not printed; file mode 600 |
 | Second `mynet init` without `--force` | Exit 1, message mentions `--force` |
-| Two `--config-dir` trees | Distinct public keys |
+| `cargo test --workspace` after Phase 2 | 35 passed, `RUSTFLAGS=-D warnings` clean |
+| `mynet peer add/list/remove` | Stores overlay IP + public key; state `disconnected`; file intended `0600` |
+| Add own public key | Exit 1, `refusing to add this node's own public key` |
 | `mynet peer add/list/remove` | Round-trip; duplicate key rejected; `8.8.8.8` rejected |
 
 ## Known Problems

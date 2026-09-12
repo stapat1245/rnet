@@ -42,6 +42,11 @@ cargo run -p mynet-cli -- --help
 cargo run -p mynet-cli -- version
 ```
 
+```bash
+mynet init
+mynet identity
+```
+
 After install (or `cargo run -p mynet-cli --`):
 
 ```bash

@@ -14,13 +14,13 @@ This is not a Tailscale clone. Cryptography is not invented here. Encryption is 
 
 Verified 2026-09-13 on this machine:
 
-* `cargo test --workspace` — 24 tests passed (cli 2 unit + 8 integration, core 2, identity 12)
+* `RUSTFLAGS="-D warnings" cargo test --workspace` — 24 tests passed, no warnings
 * `mynet --help`, `mynet version`, `mynet --version` exit 0
 * `mynet init` then `mynet identity` round-trip; second `init` without `--force` fails
 * Two config directories produce different public keys
 * Identity file mode is `0600`; private key is not printed
 
-Platform: Ubuntu 24.04.4 LTS, kernel 7.0.0-31-generic, `rustc 1.75.0` from the distro (no rustup). `wireguard-tools` 1.0.20210914 and in-tree `wireguard.ko` 1.0.0 are present. `CONFIG_TUN=y`. In the development sandbox `/dev/net/tun` was not visible; TUN/WireGuard interface creation was **not** executed. Phase 3 remains blocked on a usable TUN node plus `CAP_NET_ADMIN`.
+Platform: Ubuntu 24.04.4 LTS, kernel 7.0.0-31-generic, `rustc 1.75.0` from the distro (no rustup). `wireguard-tools` 1.0.20210914 and in-tree `wireguard.ko` 1.0.0 are present. Host `/dev/net/tun` exists (`crw-rw-rw-`). Opening it as uid 1000 succeeded; `ip tuntap add` failed with `ioctl(TUNSETIFF): Operation not permitted` (no `CAP_NET_ADMIN`; `sudo -n` needs a password). Phase 3 cannot create an interface in this session.
 
 ## Architecture
 
@@ -96,7 +96,7 @@ cargo run -p mynet-cli -- version
 cargo run -p mynet-cli -- --version
 ```
 
-All three succeeded. `wg --version` reports `wireguard-tools v1.0.20210914`. TUN interface creation was **not** run (sandbox/host-mutation restriction; `/dev/net/tun` not visible in the sandbox).
+All three succeeded. `wg --version` reports `wireguard-tools v1.0.20210914`. `/dev/net/tun` exists on the host. Creating a TUN with `ip tuntap add` returned `Operation not permitted` without `CAP_NET_ADMIN`.
 
 ### Exit criteria
 

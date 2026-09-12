@@ -55,7 +55,7 @@ Control plane talks to a coordinator. Data plane does not.
 
 ## Linux/TUN Notes
 
-The agent sandbox used for some commands could not see `/dev/net/tun` (ENOENT) and only listed `lo`. Treat sandbox network views as incomplete.
+The host inspection (2026-09-12) could see `/dev/net/tun`. Some later sandboxed commands may hide it; the host result is the one that matters.
 
 Observed on the host (2026-09-12):
 
@@ -94,7 +94,7 @@ description:    WireGuard secure network tunnel
 
 The module is in-tree. Userspace tools are installed. Creating a WireGuard link still needs `CAP_NET_ADMIN`.
 
-WireGuard identity is a Curve25519 keypair. mynet Phase 1 will generate that key type so Phase 5 can load the same file into `wg set`.
+WireGuard identity is a Curve25519 keypair. Phase 1 generates that key type so Phase 5 can load the same file into `wg set`.
 
 Allowed IPs will map overlay addresses (for example `10.42.0.2/32`) onto a peer public key. Endpoint is discovery data, not identity.
 

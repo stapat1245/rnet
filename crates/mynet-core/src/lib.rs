@@ -16,9 +16,13 @@ use std::path::{Path, PathBuf};
 
 mod local;
 mod peer;
+mod session;
 
-pub use local::{LocalConfig, LocalError};
-pub use peer::{parse_endpoint, Peer, PeerError, PeerList, PeerState};
+pub use local::{split_host_port, LocalConfig, LocalError};
+pub use peer::{parse_endpoint, ApplyKind, Peer, PeerError, PeerList, PeerState};
+pub use session::{
+    SessionError, SessionEvent, SessionIoError, SessionRow, SessionTable, HANDSHAKE_TIMEOUT_SECS,
+};
 
 /// CLI and package name.
 pub const APP_NAME: &str = "mynet";
@@ -34,6 +38,24 @@ pub const DEFAULT_OVERLAY_PREFIX: &str = "10.42.0.0/24";
 
 /// Default listen/transport port for later UDP / WireGuard phases.
 pub const DEFAULT_LISTEN_PORT: u16 = 51820;
+
+/// Default TCP port for the optional coordination server (control plane only).
+/// This is not the WireGuard data-plane port.
+pub const DEFAULT_COORDINATOR_PORT: u16 = 9993;
+
+/// Default UDP port for the optional pair relay (data-plane fallback).
+/// Distinct from the coordinator TCP port and from WireGuard.
+pub const DEFAULT_RELAY_PORT: u16 = 9994;
+
+/// Default UDP port for the standalone hole-punch experiment.
+pub const DEFAULT_HOLEPUNCH_PORT: u16 = 3478;
+
+/// WireGuard persistent-keepalive (seconds). Also the NAT binding refresh
+/// for the kernel WG socket.
+pub const WG_PERSISTENT_KEEPALIVE_SECS: u16 = 25;
+
+/// How often `mynet connect` re-registers with the coordinator.
+pub const COORDINATOR_SYNC_SECS: u64 = 30;
 
 /// Environment override for the config directory. Used by tests and `--config-dir`.
 pub const CONFIG_DIR_ENV: &str = "MYNET_CONFIG_DIR";
@@ -83,6 +105,12 @@ pub fn local_path() -> PathBuf {
 /// Local overlay settings inside an explicit config directory.
 pub fn local_path_in(dir: &Path) -> PathBuf {
     dir.join("local.toml")
+}
+
+/// Live per-peer connection states while `mynet connect` is running.
+/// Deleted on disconnect. Not identity; not a substitute for `peers.toml`.
+pub fn session_path_in(dir: &Path) -> PathBuf {
+    dir.join("session.toml")
 }
 
 #[cfg(test)]

@@ -88,6 +88,7 @@ impl TunDevice {
         let cidr = format!("{addr}/{prefix}");
         ip(&["addr", "replace", &cidr, "dev", &self.name])?;
         ip(&["link", "set", "dev", &self.name, "up"])?;
+        crate::tun::install_overlay_route(&self.name)?;
         tracing::info!(interface = %self.name, cidr = %cidr, "TUN configured");
         Ok(())
     }
@@ -157,6 +158,41 @@ pub(crate) fn find_ip() -> Result<std::path::PathBuf, TunError> {
     Err(TunError::IpMissing)
 }
 
+/// `ip route replace 10.42.0.0/24 dev <iface>` (idempotent).
+/// Assigning `addr/24` already creates a kernel connected route; this makes
+/// the overlay path explicit and repairs leftovers after a crash.
+pub fn install_overlay_route(iface: &str) -> Result<(), TunError> {
+    ip(&["route", "replace", mynet_core::DEFAULT_OVERLAY_PREFIX, "dev", iface])
+}
+
+pub fn remove_overlay_route(iface: &str) -> Result<(), TunError> {
+    match ip(&["route", "del", mynet_core::DEFAULT_OVERLAY_PREFIX, "dev", iface]) {
+        Ok(()) => Ok(()),
+        Err(TunError::IpFailed { .. }) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn overlay_route_replace_args(iface: &str) -> Vec<String> {
+    vec![
+        "route".into(),
+        "replace".into(),
+        mynet_core::DEFAULT_OVERLAY_PREFIX.into(),
+        "dev".into(),
+        iface.into(),
+    ]
+}
+
+pub fn overlay_route_del_args(iface: &str) -> Vec<String> {
+    vec![
+        "route".into(),
+        "del".into(),
+        mynet_core::DEFAULT_OVERLAY_PREFIX.into(),
+        "dev".into(),
+        iface.into(),
+    ]
+}
+
 /// Privilege probe used by tests and `mynet doctor`-style commands.
 pub fn tun_available() -> Result<(), TunError> {
     // Open and immediately drop. A unique name avoids colliding with mynet0.
@@ -186,5 +222,14 @@ mod tests {
             }
             Err(other) => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn overlay_route_args_use_default_prefix() {
+        let add = overlay_route_replace_args("mynet0");
+        assert!(add.contains(&"10.42.0.0/24".to_string()));
+        assert!(add.contains(&"mynet0".to_string()));
+        let del = overlay_route_del_args("mynet0");
+        assert_eq!(del[1], "del");
     }
 }

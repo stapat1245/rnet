@@ -10,9 +10,9 @@ This is not a Tailscale clone. Cryptography is not invented here. Encryption is 
 
 ## Current Status
 
-**Phases 0–2 COMPLETE. Phases 3–6 implemented; live TUN/WireGuard not verified (no CAP_NET_ADMIN).**
+**Phases 0–2 COMPLETE. Phases 3–16 implemented in code. Live TUN/WireGuard/two-NAT/relay ping not verified (no CAP_NET_ADMIN / one host).**
 
-`RUSTFLAGS="-D warnings" cargo test --workspace` on 2026-09-13: **51 tests passed**, no warnings.
+`RUSTFLAGS="-D warnings" cargo test --workspace` on 2026-09-13: **85 tests passed**, no warnings.
 
 | Phase | Code | Privileged live path |
 | --- | --- | --- |
@@ -20,6 +20,16 @@ This is not a Tailscale clone. Cryptography is not invented here. Encryption is 
 | 4 Plain UDP | `mynet connect --plain` | Logic tested; no two-TUN ping |
 | 5 WireGuard | `mynet connect` | `wg set` argv tested; `ip link add type wireguard` not executed |
 | 6 Manual exchange | `mynet export` / `peer import` | **Verified** in CLI tests |
+| 7 Identity assoc. | `PeerList::apply_discovery` | Unknown key / overlay-IP mismatch tests |
+| 8 Coordinator | `mynet-coordinator` Docker | Register/discover tests; no VPN proxy kind |
+| 9 Endpoints | `mynet join` / `sync` | Endpoint update tests; live WG reconnect not run |
+| 10 NAT model | `mynet-natpunch` | Localhost punch + simulated cone vs symmetric |
+| 11 Session SM | `SessionTable` | Transition table tests |
+| 12 Keepalives | WG keepalive 25s + coord sync 30s | Arg/parse tests |
+| 13 Relay | `mynet-relay` pair UDP | Opaque forward tests; live failover not run |
+| 14 Addresses | `--allocate` | Next-free-IP test |
+| 15 Routes | `ip route replace 10.42.0.0/24` | Argv tests |
+| 16 Status | `mynet status` | Per-peer state from `session.toml` |
 
 Run on a privileged host:
 
@@ -55,18 +65,22 @@ mynet/
 ├── Cargo.toml              workspace
 ├── plan.md
 ├── notes.md
+├── execution.md            how to run: VPS vs laptops, Docker
+├── docker-compose.yml      coordinator; optional `--profile relay`
 ├── README.md
 └── crates/
     ├── mynet-cli/          clap binary (`mynet`)
-    ├── mynet-core/         shared constants, paths, peers, local overlay config
+    ├── mynet-core/         shared constants, paths, peers, sessions
     ├── mynet-identity/     X25519 identity
     ├── mynet-vpn/          Linux TUN + kernel WireGuard (`ip`/`wg`)
-    └── mynet-transport/    UDP + experimental plaintext overlay framing
+    ├── mynet-transport/    UDP + experimental plaintext overlay framing
+    ├── mynet-protocol/     coordinator TCP framing (TOML, not VPN packets)
+    ├── mynet-coordinator/  binary `mynet-coordinator` (Docker on the VPS)
+    ├── mynet-natpunch/     standalone UDP hole-punch experiment
+    └── mynet-relay/        two-peer opaque UDP relay
 ```
 
-Further crates (`mynet-vpn`, `mynet-transport`, `mynet-protocol`, `mynet-coordinator`) are added when a phase actually needs them. Empty crates are not created for decoration.
-
-Default overlay: `10.42.0.0/24`. Default interface name: `mynet0`. Default WireGuard/UDP port: `51820`.
+Default overlay: `10.42.0.0/24`. Default interface name: `mynet0`. Default WireGuard/UDP port: `51820`. Default coordinator TCP port: `9993`. Default pair-relay UDP port: `9994`.
 
 ## Phase 0
 
@@ -390,11 +404,11 @@ Out-of-band exchange of peer records — **met**. Direct encrypted P2P ping — 
 
 ### Known limitations
 
-Endpoint changes require re-export / `peer add` updates. Coordinator still absent (intentional).
+Endpoint changes can also be done via the coordinator (`mynet sync`, Phase 8–9). Manual export remains valid.
 
 ## Phase 7
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED (association tests; live WireGuard handshake not verified)
 
 ### Objective
 
@@ -406,29 +420,29 @@ Phase 6.
 
 ### Implementation tasks
 
-- [ ] Associate public key, peer ID, virtual IP, endpoint
-- [ ] Reject mismatched allowed IPs / unknown keys
-- [ ] Document threat model
+- [x] Associate public key, peer ID, virtual IP, endpoint
+- [x] Reject mismatched allowed IPs / unknown keys (`PeerList::apply_discovery`; WG AllowedIPs are `/32` of the trusted mapping)
+- [x] Document threat model (`notes.md`, `execution.md`)
 
 ### Tests
 
-Unknown peer, wrong public key, stale endpoint handling (as applicable).
+Unknown key rejected unless join-token trust; virtual-IP mismatch for a known key rejected; endpoint can change without changing identity.
 
 ### Manual verification
 
-Traffic from an untrusted key does not decrypt into the overlay.
+Traffic from an untrusted key does not decrypt into the overlay — **not run** (needs two privileged hosts). Kernel WireGuard cryptokey routing is the mechanism.
 
 ### Exit criteria
 
-Only configured public keys can send overlay traffic.
+Only configured public keys can send overlay traffic — **met in code** (unknown keys never get a `wg set peer` entry). Live proof pending root.
 
 ### Known limitations
 
-Does not solve stolen private keys. Coordinator compromise is N/A until Phase 8.
+Does not solve stolen private keys. A compromised coordinator can advertise extra members to nodes that `join`/`sync` with the token.
 
 ## Phase 8
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED (control-plane unit/integration tests)
 
 ### Objective
 
@@ -440,29 +454,29 @@ Phase 7.
 
 ### Implementation tasks
 
-- [ ] Minimal coordinator protocol
-- [ ] Store as little as practical
-- [ ] Node works for already-established direct sessions if coordinator dies
+- [x] Minimal coordinator protocol (TCP, length-prefixed TOML, `register` / `discover`)
+- [x] Store as little as practical (public key, overlay IP, UDP endpoint, last_seen)
+- [x] Node works for already-established direct sessions if coordinator dies (`connect` warns and keeps last endpoints)
 
 ### Tests
 
-Register/discover; coordinator outage does not tear down documented data-plane behavior.
+Register/discover two peers; bad token; no `forward` kind; state persist. Coordinator outage does not tear down documented data-plane behavior (connect continues with last peers).
 
 ### Manual verification
 
-Alice and Bob find each other through coordinator; ping still does not traverse the coordinator.
+Alice and Bob find each other through coordinator — **control plane tested**. Ping still does not traverse the coordinator — **by construction** (no data-plane message type); two-host ping not run.
 
 ### Exit criteria
 
-Coordinator is control-plane only.
+Coordinator is control-plane only — **met**.
 
 ### Known limitations
 
-No NAT traversal yet.
+No NAT traversal yet. Coordinator is plaintext TCP (join token is the membership secret, not TLS).
 
 ## Phase 9
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED (endpoint update tests; live reconnect not verified)
 
 ### Objective
 
@@ -474,28 +488,28 @@ Phase 8.
 
 ### Implementation tasks
 
-- [ ] Periodic endpoint publish
-- [ ] Apply updated endpoints to WireGuard peer config
+- [x] Periodic endpoint publish (`mynet connect` re-registers every 30s; `mynet sync` on demand)
+- [x] Apply updated endpoints to WireGuard peer config (`upsert_wg_peer` without rewriting the private key)
 
 ### Tests
 
-Endpoint update without identity change.
+Endpoint update without identity change (coordinator + `PeerList`).
 
 ### Manual verification
 
-Change UDP port; peer reconnects.
+Change UDP port; peer reconnects — **not run**.
 
 ### Exit criteria
 
-A peer can move without minting a new key.
+A peer can move without minting a new key — **met in control plane**.
 
 ### Known limitations
 
-Symmetric NAT still fails.
+Symmetric NAT still fails. Observed TCP IP plus WG listen port is a hint, not a hole punch.
 
 ## Phase 10
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED (model + localhost/simulated tests; two real NATs not available)
 
 ### Objective
 
@@ -507,29 +521,29 @@ Phase 9. Written NAT notes before code.
 
 ### Implementation tasks
 
-- [ ] Write NAT section in `notes.md` before implementation
-- [ ] Standalone UDP hole-punch experiment
-- [ ] Record failures explicitly
+- [x] Write NAT section in `notes.md` before implementation
+- [x] Standalone UDP hole-punch experiment (`mynet-natpunch`)
+- [x] Record failures explicitly (symmetric NAT forecast Unlikely; simulate_hole_punch returns false)
 
 ### Tests
 
-Same-LAN vs distinct-NAT scenarios that this lab can actually create.
+Same-LAN localhost punch. Distinct-NAT: **not available** on this lab; cone vs symmetric simulated in-process.
 
 ### Manual verification
 
-Two NATed peers, if available.
+Two NATed peers — **not run**.
 
 ### Exit criteria
 
-Documented behavior for the NAT types actually tested. Failures recorded.
+Documented behavior for the NAT types actually tested. Failures recorded — **met** for localhost + mapping model.
 
 ### Known limitations
 
-Symmetric NAT often cannot hole-punch.
+Symmetric NAT often cannot hole-punch. Kernel WireGuard owns UDP 51820 so this experiment is not STUN-on-the-WG-socket.
 
 ## Phase 11
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED (state machine + `session.toml`; live handshake not verified)
 
 ### Objective
 
@@ -541,8 +555,8 @@ Phases 5–9 (relay state lands in Phase 13).
 
 ### Implementation tasks
 
-- [ ] `Disconnected → Discovering → Connecting → Direct | Relaying | Failed`
-- [ ] `tracing` on every transition
+- [x] `Disconnected → Discovering → Connecting → Direct | Relaying | Failed`
+- [x] `tracing` on every transition
 
 ### Tests
 
@@ -550,19 +564,19 @@ State transition table.
 
 ### Manual verification
 
-`mynet status` reflects states (when CLI exists).
+`mynet status` reflects states from `session.toml` while connected.
 
 ### Exit criteria
 
-Connection logic is not scattered.
+Connection logic is not scattered — **met** (`mynet-core` `SessionTable`).
 
 ### Known limitations
 
-Relay branch unused until Phase 13.
+Relay branch unused until a relay is configured. Handshake-ok uses `wg show latest-handshakes` (needs a live WG iface).
 
 ## Phase 12
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED (keepalive constants + republish on src IP change)
 
 ### Objective
 
@@ -574,20 +588,20 @@ Phase 11.
 
 ### Implementation tasks
 
-- [ ] UDP keepalives
-- [ ] Re-resolve/re-publish after network change
+- [x] UDP keepalives (kernel WG `persistent-keepalive` = 25s)
+- [x] Re-resolve/re-publish after network change (`ip route get` `src` watch)
 
 ### Tests
 
-Keepalive interval; stale endpoint replacement.
+Keepalive interval in `wg set` argv; `src` parse; stale endpoint replacement remains Phase 9 sync.
 
 ### Manual verification
 
-Idle connection survives typical NAT timeout if testable.
+Idle connection survives typical NAT timeout if testable — **not run**.
 
 ### Exit criteria
 
-Long-lived direct sessions do not silently die without logs.
+Long-lived direct sessions do not silently die without logs — **met in code** (sync + keepalive + src-change log).
 
 ### Known limitations
 
@@ -595,7 +609,7 @@ Cannot fully test laptop sleep here.
 
 ## Phase 13
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED (pair UDP relay; live two-host failover not run)
 
 ### Objective
 
@@ -607,8 +621,8 @@ Direct P2P works (Phase 5+). Distinct from coordinator.
 
 ### Implementation tasks
 
-- [ ] Relay protocol
-- [ ] Fail over when direct connect fails
+- [x] Relay protocol (two-peer UDP copy; no keys)
+- [x] Fail over when direct connect fails (`HandshakeTimeout` → `RelayReady` if `--relay` set)
 
 ### Tests
 
@@ -616,19 +630,19 @@ Relay does not need keys to forward; payload remains opaque.
 
 ### Manual verification
 
-Force direct failure; ping still works via relay.
+Force direct failure; ping still works via relay — **not run**.
 
 ### Exit criteria
 
-Relay is optional and ciphertext-only.
+Relay is optional and ciphertext-only — **met** for a two-node WG pair (both endpoints pointed at the relay).
 
 ### Known limitations
 
-Relay sees endpoints and timing. Not a privacy network.
+Relay sees endpoints and timing. Not a privacy network. Third peer cannot be demuxed (no dest header on WG packets). Coordinator stays control-plane only.
 
 ## Phase 14
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED (explicit `--ip` plus optional `--allocate`)
 
 ### Objective
 
@@ -640,20 +654,20 @@ Working overlay.
 
 ### Implementation tasks
 
-- [ ] Explicit allocation first
-- [ ] Optional coordinator allocator later
+- [x] Explicit allocation first (`--ip`)
+- [x] Optional coordinator allocator (`mynet join --allocate`)
 
 ### Tests
 
-Conflict detection for duplicate virtual IPs.
+Conflict detection for duplicate virtual IPs (Phase 2). Next-free-IP from coordinator.
 
 ### Manual verification
 
-Two peers get distinct addresses.
+Two peers get distinct addresses — coordinator test assigns `.1` then `.2`.
 
 ### Exit criteria
 
-No silent IP collision in the explicit-config design.
+No silent IP collision in the explicit-config design — **met**.
 
 ### Known limitations
 
@@ -661,7 +675,7 @@ Not decentralized allocation.
 
 ## Phase 15
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED (explicit overlay route helpers)
 
 ### Objective
 
@@ -673,29 +687,29 @@ Working interface.
 
 ### Implementation tasks
 
-- [ ] Install `10.42.0.0/24 dev mynet0`
-- [ ] Remove on disconnect
-- [ ] Document conflicts
+- [x] Install `10.42.0.0/24 dev mynet0`
+- [x] Remove on disconnect (`ip link del` drops the route)
+- [x] Document conflicts
 
 ### Tests
 
-Route install/remove helpers.
+Route install/remove helpers (argv).
 
 ### Manual verification
 
-`ping`, `ssh`, `curl` to overlay IPs behave naturally.
+`ping`, `ssh`, `curl` to overlay IPs behave naturally — **not run** (needs TUN).
 
 ### Exit criteria
 
-Applications need no special sockets.
+Applications need no special sockets — **met in design** (`addr/24` + explicit route).
 
 ### Known limitations
 
-No IPv6. No mesh to foreign subnets.
+No IPv6. No mesh to foreign subnets. `addr replace 10.42.0.1/24` already installs a kernel connected route; explicit `route replace` documents and repairs leftovers.
 
 ## Phase 16
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED (core operator loop)
 
 ### Objective
 
@@ -707,8 +721,8 @@ Earlier commands exist incrementally.
 
 ### Implementation tasks
 
-- [ ] Prioritize init/identity/peer/connect/status/disconnect
-- [ ] Human-readable status
+- [x] Prioritize init/identity/peer/connect/status/disconnect
+- [x] Human-readable status (identity, overlay, coordinator host, relay, per-peer state)
 
 ### Tests
 
@@ -716,15 +730,15 @@ CLI parsing and status formatting.
 
 ### Manual verification
 
-Operator can understand a session from `status` alone.
+Operator can understand a session from `status` alone — formatting is in; live WG fields need a running `connect`.
 
 ### Exit criteria
 
-Core operator loop works without reading source.
+Core operator loop works without reading source — **met**.
 
 ### Known limitations
 
-No web UI. No MagicDNS.
+No web UI. No MagicDNS. `mynet doctor` still deferred.
 
 ## Testing Strategy
 

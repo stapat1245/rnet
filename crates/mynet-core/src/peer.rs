@@ -42,6 +42,18 @@ impl PeerState {
             PeerState::Failed => "failed",
         }
     }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "disconnected" => Some(PeerState::Disconnected),
+            "discovering" => Some(PeerState::Discovering),
+            "connecting" => Some(PeerState::Connecting),
+            "direct" => Some(PeerState::Direct),
+            "relaying" => Some(PeerState::Relaying),
+            "failed" => Some(PeerState::Failed),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for PeerState {
@@ -261,6 +273,43 @@ impl PeerList {
         self.find_index(query).map(|i| &self.peers[i])
     }
 
+    pub fn get_by_public_key(&self, public_key: &PublicKey) -> Option<&Peer> {
+        self.peers.iter().find(|p| p.public_key == *public_key)
+    }
+
+    /// Apply a discovered member. Public key is identity; overlay IP is a
+    /// local mapping that cannot change for a known key; endpoint is discovery.
+    ///
+    /// Unknown keys are rejected unless `allow_new` is set (join-token trust).
+    pub fn apply_discovery(
+        &mut self,
+        public_key: PublicKey,
+        virtual_ip: Ipv4Addr,
+        endpoint: Option<SocketAddr>,
+        allow_new: bool,
+        name: Option<String>,
+    ) -> Result<ApplyKind, PeerError> {
+        if let Some(idx) = self.peers.iter().position(|p| p.public_key == public_key) {
+            if self.peers[idx].virtual_ip != virtual_ip {
+                return Err(PeerError::VirtualIpMismatch {
+                    trusted: self.peers[idx].virtual_ip,
+                    advertised: virtual_ip,
+                });
+            }
+            if self.peers[idx].endpoint == endpoint {
+                return Ok(ApplyKind::Unchanged);
+            }
+            self.peers[idx].endpoint = endpoint;
+            return Ok(ApplyKind::EndpointUpdated);
+        }
+        if !allow_new {
+            return Err(PeerError::UnknownPublicKey);
+        }
+        let peer = Peer::new(public_key, virtual_ip, endpoint, name)?;
+        self.add(peer)?;
+        Ok(ApplyKind::Added)
+    }
+
     fn find_index(&self, query: &str) -> Option<usize> {
         let q = query.trim();
         self.peers.iter().position(|p| {
@@ -364,6 +413,21 @@ pub enum PeerError {
     InvalidEndpoint(String),
     #[error("invalid peer name {0:?}; use 1-32 characters [A-Za-z0-9_-]")]
     InvalidName(String),
+    #[error("unknown public key is not in the trusted peer list")]
+    UnknownPublicKey,
+    #[error("refusing advertised overlay IP {advertised} for a known key (trusted mapping is {trusted})")]
+    VirtualIpMismatch {
+        trusted: Ipv4Addr,
+        advertised: Ipv4Addr,
+    },
+}
+
+/// Result of applying a coordinator or manual discovery update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyKind {
+    Added,
+    EndpointUpdated,
+    Unchanged,
 }
 
 fn validate_virtual_ip(ip: Ipv4Addr) -> Result<(), PeerError> {
@@ -526,5 +590,83 @@ mod tests {
     fn remove_unknown_peer() {
         let mut list = PeerList::new();
         assert!(matches!(list.remove("nope"), Err(PeerError::NotFound(_))));
+    }
+
+    #[test]
+    fn discovery_updates_endpoint_without_changing_identity() {
+        let identity = Identity::generate();
+        let pk = identity.public_key();
+        let mut list = PeerList::new();
+        list.add(
+            Peer::new(
+                pk,
+                "10.42.0.2".parse().unwrap(),
+                Some("192.0.2.10:51820".parse().unwrap()),
+                Some("bob".into()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let kind = list
+            .apply_discovery(
+                pk,
+                "10.42.0.2".parse().unwrap(),
+                Some("203.0.113.50:51821".parse().unwrap()),
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(kind, ApplyKind::EndpointUpdated);
+        let peer = list.get("bob").unwrap();
+        assert_eq!(peer.public_key, pk);
+        assert_eq!(peer.virtual_ip, "10.42.0.2".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(peer.endpoint.unwrap().to_string(), "203.0.113.50:51821");
+    }
+
+    #[test]
+    fn discovery_rejects_unknown_key_unless_join() {
+        let identity = Identity::generate();
+        let mut list = PeerList::new();
+        let err = list
+            .apply_discovery(
+                identity.public_key(),
+                "10.42.0.2".parse().unwrap(),
+                Some("192.0.2.10:51820".parse().unwrap()),
+                false,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, PeerError::UnknownPublicKey));
+        let kind = list
+            .apply_discovery(
+                identity.public_key(),
+                "10.42.0.2".parse().unwrap(),
+                Some("192.0.2.10:51820".parse().unwrap()),
+                true,
+                Some("bob".into()),
+            )
+            .unwrap();
+        assert_eq!(kind, ApplyKind::Added);
+        assert_eq!(list.peers().len(), 1);
+    }
+
+    #[test]
+    fn discovery_rejects_virtual_ip_mismatch_for_known_key() {
+        let identity = Identity::generate();
+        let pk = identity.public_key();
+        let mut list = PeerList::new();
+        list.add(Peer::new(pk, "10.42.0.2".parse().unwrap(), None, None).unwrap())
+            .unwrap();
+        let err = list
+            .apply_discovery(pk, "10.42.0.3".parse().unwrap(), None, true, None)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PeerError::VirtualIpMismatch {
+                trusted,
+                advertised
+            } if trusted.to_string() == "10.42.0.2" && advertised.to_string() == "10.42.0.3"
+        ));
+        assert_eq!(list.peers()[0].virtual_ip.to_string(), "10.42.0.2");
     }
 }

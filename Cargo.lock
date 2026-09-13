@@ -355,10 +355,27 @@ dependencies = [
  "libc",
  "mynet-core",
  "mynet-identity",
+ "mynet-protocol",
  "mynet-transport",
  "mynet-vpn",
  "serde",
  "tempfile",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mynet-coordinator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mynet-core",
+ "mynet-identity",
+ "mynet-protocol",
+ "serde",
+ "tempfile",
+ "thiserror",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -399,6 +416,7 @@ dependencies = [
  "thiserror",
  "thiserror-impl",
  "toml",
+ "tracing",
  "tracing-attributes",
  "tracing-core",
 ]
@@ -416,6 +434,37 @@ dependencies = [
  "toml",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "mynet-natpunch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mynet-core",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mynet-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "mynet-relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mynet-core",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

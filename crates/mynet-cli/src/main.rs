@@ -3,24 +3,29 @@
 //! `tun-test` and `connect --plain` are learning paths. Encrypted traffic
 //! uses kernel WireGuard (`mynet connect` without `--plain`).
 
+mod coord;
+
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use mynet_core::{
-    config_dir, identity_path_in, local_path_in, parse_endpoint, peers_path_in, LocalConfig, Peer,
-    PeerList, APP_NAME, CONFIG_DIR_ENV, DEFAULT_INTERFACE, DEFAULT_LISTEN_PORT, VERSION,
+    config_dir, identity_path_in, local_path_in, parse_endpoint, peers_path_in, session_path_in,
+    LocalConfig, LocalError, Peer, PeerList, PeerState, SessionEvent, SessionTable, APP_NAME,
+    CONFIG_DIR_ENV, COORDINATOR_SYNC_SECS, DEFAULT_COORDINATOR_PORT, DEFAULT_INTERFACE,
+    DEFAULT_LISTEN_PORT, HANDSHAKE_TIMEOUT_SECS, VERSION,
 };
 use mynet_identity::{Identity, PublicKey};
 use mynet_transport::run_plain_loop;
 use mynet_vpn::{
-    apply_wireguard, parse_ipv4, teardown_wireguard, TunDevice, TunError, WgPeer,
+    apply_wireguard, parse_ipv4, primary_ipv4, teardown_wireguard, upsert_wg_peer,
+    wg_latest_handshakes, TunDevice, TunError, WgPeer,
 };
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -93,6 +98,9 @@ enum CliCommand {
         /// INSECURE: TUN + plaintext UDP instead of WireGuard
         #[arg(long)]
         plain: bool,
+        /// Optional two-peer UDP relay (fallback if direct handshake times out)
+        #[arg(long)]
+        relay: Option<String>,
     },
     /// Tear down the overlay interface
     Disconnect {
@@ -107,6 +115,36 @@ enum CliCommand {
         #[arg(long)]
         endpoint: Option<String>,
     },
+    /// Register with a coordinator and trust advertised members (join token = membership)
+    Join {
+        /// Coordinator host:port (VPS public IP and published TCP port)
+        #[arg(long)]
+        coordinator: String,
+        /// Shared join token (same value as MYNET_JOIN_TOKEN on the VPS)
+        #[arg(long, env = "MYNET_JOIN_TOKEN")]
+        token: String,
+        #[arg(long)]
+        ip: Option<Ipv4Addr>,
+        /// Ask the coordinator for the next free overlay IP instead of passing --ip
+        #[arg(long)]
+        allocate: bool,
+        #[arg(long, default_value_t = DEFAULT_LISTEN_PORT)]
+        listen_port: u16,
+        #[arg(long, default_value = DEFAULT_INTERFACE)]
+        interface: String,
+        /// Optional self-declared WireGuard UDP endpoint (host:port)
+        #[arg(long)]
+        endpoint: Option<String>,
+        #[arg(long)]
+        network: Option<String>,
+    },
+    /// Re-register, refresh endpoints, and pick up new members from the coordinator
+    Sync {
+        #[arg(long)]
+        endpoint: Option<String>,
+    },
+    /// Show identity, overlay, coordinator host (never the join token)
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -287,9 +325,26 @@ fn print_peer(peer: &Peer) {
     println!("  State:      {}", peer.state.as_str());
 }
 
-fn persist_local(dir: &Path, ip: Ipv4Addr, listen_port: u16, interface: String) -> Result<LocalConfig> {
-    let cfg = LocalConfig::new(ip, listen_port, interface)?;
-    cfg.save_to(&local_path_in(dir))?;
+fn persist_overlay(
+    dir: &Path,
+    ip: Ipv4Addr,
+    listen_port: u16,
+    interface: String,
+) -> Result<LocalConfig> {
+    let path = local_path_in(dir);
+    let existing = match LocalConfig::load_from(&path) {
+        Ok(c) => Some(c),
+        Err(LocalError::NotFound { .. }) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let mut cfg = LocalConfig::new(ip, listen_port, interface)?;
+    if let Some(old) = existing {
+        cfg.coordinator = old.coordinator;
+        cfg.network = old.network;
+        cfg.join_token = old.join_token;
+        cfg.relay = old.relay;
+    }
+    cfg.save_to(&path)?;
     Ok(cfg)
 }
 
@@ -369,13 +424,34 @@ fn cmd_connect(
     listen_port: u16,
     interface: String,
     plain: bool,
+    relay: Option<String>,
 ) -> Result<()> {
     let identity = Identity::load_from(&identity_path_in(dir))?;
     let ip = match ip {
         Some(ip) => ip,
         None => LocalConfig::load_from(&local_path_in(dir))?.virtual_ip,
     };
-    let cfg = persist_local(dir, ip, listen_port, interface.clone())?;
+    let mut cfg = persist_overlay(dir, ip, listen_port, interface.clone())?;
+    if let Some(relay) = relay {
+        mynet_core::split_host_port(&relay)?;
+        cfg.relay = Some(relay);
+        cfg.save_to(&local_path_in(dir))?;
+    }
+    if cfg.coordinator.is_some() {
+        match coord::register_and_apply(
+            dir,
+            &identity,
+            &cfg,
+            true,
+            None,
+        ) {
+            Ok(report) => coord::print_report(&report),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "coordinator unreachable; connecting with last known peers"
+            ),
+        }
+    }
     let list = PeerList::load_from(&peers_path_in(dir))?;
 
     if plain {
@@ -383,7 +459,7 @@ fn cmd_connect(
         println!("This is a learning path. It is NOT the VPN. Use `mynet connect` for WireGuard.");
         cmd_connect_plain(&cfg, &list)?;
     } else {
-        cmd_connect_wireguard(&identity, &cfg, &list)?;
+        cmd_connect_wireguard(dir, &identity, &cfg, &list)?;
     }
     Ok(())
 }
@@ -408,7 +484,16 @@ fn cmd_connect_plain(cfg: &LocalConfig, list: &PeerList) -> Result<()> {
     Ok(())
 }
 
-fn cmd_connect_wireguard(identity: &Identity, cfg: &LocalConfig, list: &PeerList) -> Result<()> {
+fn cmd_connect_wireguard(
+    dir: &Path,
+    identity: &Identity,
+    cfg: &LocalConfig,
+    list: &PeerList,
+) -> Result<()> {
+    let relay_addr = match &cfg.relay {
+        Some(s) => Some(resolve_host_port(s)?),
+        None => None,
+    };
     let peers: Vec<WgPeer> = list
         .peers()
         .iter()
@@ -433,15 +518,153 @@ fn cmd_connect_wireguard(identity: &Identity, cfg: &LocalConfig, list: &PeerList
         "WireGuard {} {}  UDP :{}",
         cfg.interface, cfg.virtual_ip, cfg.listen_port
     );
+    if let Some(c) = &cfg.coordinator {
+        println!("coordinator {c} (control plane only; overlay UDP does not go there)");
+    }
+    if let Some(r) = &cfg.relay {
+        println!("relay {r} (opaque UDP fallback for two peers; not the coordinator)");
+    }
     let _ = dump_ip(&["addr", "show", "dev", &cfg.interface]);
+    let _ = dump_ip(&["route", "show", "dev", &cfg.interface]);
     let _ = dump_wg(&cfg.interface);
+
+    let session_path = session_path_in(dir);
+    let mut sessions = SessionTable::new();
+    for p in list.peers() {
+        let pk = p.public_key.to_base64();
+        let _ = sessions.apply(&pk, SessionEvent::Start, None);
+        if p.endpoint.is_some() {
+            let _ = sessions.apply(&pk, SessionEvent::EndpointKnown, p.endpoint);
+        } else if relay_addr.is_some() {
+            let _ = sessions.apply(&pk, SessionEvent::RelayReady, relay_addr);
+        } else {
+            let _ = sessions.apply(&pk, SessionEvent::NoEndpoint, None);
+        }
+    }
+    let _ = sessions.save_to(&session_path);
+
     println!("Press Ctrl-C to disconnect (or run `mynet disconnect`).");
     install_stop_handler();
+    let mut last_sync = Instant::now();
+    let connecting_since = Instant::now();
+    let mut last_src = primary_ipv4();
+    let mut failed_over = false;
     while !STOP.load(Ordering::Relaxed) {
+        if let Ok(handshakes) = wg_latest_handshakes(&cfg.interface) {
+            for (pk, ts) in handshakes {
+                if ts > 0 {
+                    let _ = sessions.apply(&pk, SessionEvent::HandshakeOk, None);
+                }
+            }
+        }
+        if !failed_over && connecting_since.elapsed() >= Duration::from_secs(HANDSHAKE_TIMEOUT_SECS) {
+            let still_connecting = sessions.rows().any(|r| r.state == PeerState::Connecting);
+            if still_connecting {
+                if let Some(relay) = relay_addr {
+                    tracing::warn!(%relay, "direct handshake timed out; failing over to pair relay");
+                    for p in list.peers() {
+                        let pk = p.public_key.to_base64();
+                        if sessions.get(&pk).map(|r| r.state) == Some(PeerState::Connecting) {
+                            let _ = sessions.apply(&pk, SessionEvent::RelayReady, Some(relay));
+                            let wg = WgPeer {
+                                public_key_base64: pk,
+                                endpoint: Some(relay),
+                                allowed_ip: p.virtual_ip,
+                            };
+                            if let Err(e) = upsert_wg_peer(&cfg.interface, &wg) {
+                                tracing::warn!(error = %e, "relay endpoint update failed");
+                                let _ = sessions.apply(
+                                    &p.public_key.to_base64(),
+                                    SessionEvent::RelayFail,
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    for p in list.peers() {
+                        let pk = p.public_key.to_base64();
+                        if sessions.get(&pk).map(|r| r.state) == Some(PeerState::Connecting) {
+                            let _ = sessions.apply(&pk, SessionEvent::HandshakeTimeout, None);
+                        }
+                    }
+                }
+            }
+            failed_over = true;
+        }
+        let src_changed = {
+            let now = primary_ipv4();
+            let changed = now.is_some() && now != last_src;
+            if changed {
+                tracing::info!(src = ?now, "primary IPv4 changed; re-publishing endpoints");
+                last_src = now;
+            }
+            changed
+        };
+        if cfg.coordinator.is_some()
+            && (src_changed || last_sync.elapsed() >= Duration::from_secs(COORDINATOR_SYNC_SECS))
+        {
+            last_sync = Instant::now();
+            match coord::register_and_apply(dir, identity, cfg, true, None) {
+                Ok(report) => {
+                    if report.added > 0 || report.updated > 0 {
+                        tracing::info!(
+                            added = report.added,
+                            updated = report.updated,
+                            "applying coordinator endpoint updates"
+                        );
+                        if !failed_over || relay_addr.is_none() {
+                            apply_live_peers(dir, &cfg.interface)?;
+                            let list = PeerList::load_from(&peers_path_in(dir))?;
+                            for p in list.peers() {
+                                if let Some(ep) = p.endpoint {
+                                    let _ = sessions.apply(
+                                        &p.public_key.to_base64(),
+                                        SessionEvent::EndpointKnown,
+                                        Some(ep),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "coordinator unreachable; WireGuard session unchanged"
+                ),
+            }
+        }
+        let _ = sessions.save_to(&session_path);
         thread::sleep(Duration::from_millis(250));
     }
+    let _ = SessionTable::remove_file(&session_path);
     teardown_wireguard(&cfg.interface)?;
     println!("disconnected");
+    Ok(())
+}
+
+fn resolve_host_port(s: &str) -> Result<SocketAddr> {
+    let (host, port) = mynet_core::split_host_port(s)?;
+    use std::net::ToSocketAddrs;
+    (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolve {s}"))?
+        .find(|a| a.is_ipv4())
+        .with_context(|| format!("no IPv4 address for {s}"))
+}
+
+fn apply_live_peers(dir: &Path, iface: &str) -> Result<()> {
+    let list = PeerList::load_from(&peers_path_in(dir))?;
+    for p in list.peers() {
+        let peer = WgPeer {
+            public_key_base64: p.public_key.to_base64(),
+            endpoint: p.endpoint,
+            allowed_ip: p.virtual_ip,
+        };
+        if let Err(e) = upsert_wg_peer(iface, &peer) {
+            tracing::warn!(error = %e, public_key = %p.public_key, "wg peer update failed");
+        }
+    }
     Ok(())
 }
 
@@ -456,7 +679,8 @@ fn dump_wg(iface: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_disconnect(interface: String) -> Result<()> {
+fn cmd_disconnect(dir: &Path, interface: String) -> Result<()> {
+    let _ = SessionTable::remove_file(&session_path_in(dir));
     teardown_wireguard(&interface)?;
     // TUN devices vanish when the creating process exits; leftover names:
     let _ = ProcCommand::new("ip")
@@ -497,9 +721,99 @@ fn main() -> Result<()> {
             listen_port,
             interface,
             plain,
-        } => cmd_connect(&dir, ip, listen_port, interface, plain)?,
-        CliCommand::Disconnect { interface } => cmd_disconnect(interface)?,
+            relay,
+        } => cmd_connect(&dir, ip, listen_port, interface, plain, relay)?,
+        CliCommand::Disconnect { interface } => cmd_disconnect(&dir, interface)?,
         CliCommand::Export { ip, endpoint } => cmd_export(&dir, ip, endpoint)?,
+        CliCommand::Join {
+            coordinator,
+            token,
+            ip,
+            allocate,
+            listen_port,
+            interface,
+            endpoint,
+            network,
+        } => {
+            let ip = if allocate {
+                if ip.is_some() {
+                    bail!("pass --ip or --allocate, not both");
+                }
+                let identity = Identity::load_from(&identity_path_in(&dir))?;
+                coord::allocate_ip(&coordinator, &token, &identity.public_key().to_base64())?
+            } else {
+                ip.context("pass --ip <10.42.0.N> or --allocate")?
+            };
+            println!("Overlay IP: {ip}");
+            let report = coord::join(
+                &dir,
+                coordinator,
+                token,
+                ip,
+                listen_port,
+                interface,
+                endpoint,
+                network,
+            )?;
+            coord::print_report(&report);
+        }
+        CliCommand::Sync { endpoint } => {
+            let report = coord::sync(&dir, endpoint)?;
+            coord::print_report(&report);
+        }
+        CliCommand::Status => cmd_status(&dir)?,
+    }
+    Ok(())
+}
+
+fn cmd_status(dir: &Path) -> Result<()> {
+    let identity = Identity::load_from(&identity_path_in(dir))?;
+    print_identity(&identity);
+    match LocalConfig::load_from(&local_path_in(dir)) {
+        Ok(cfg) => {
+            println!("Overlay IP:  {}", cfg.virtual_ip);
+            println!("Listen UDP:  {}", cfg.listen_port);
+            println!("Interface:   {}", cfg.interface);
+            match cfg.coordinator {
+                Some(c) => println!("Coordinator: {c} (TCP control plane)"),
+                None => println!(
+                    "Coordinator: (none; default port {DEFAULT_COORDINATOR_PORT})"
+                ),
+            }
+            if let Some(net) = cfg.network {
+                println!("Network:     {net}");
+            }
+            match cfg.relay {
+                Some(r) => println!("Relay:       {r} (two-peer UDP fallback)"),
+                None => println!("Relay:       (none)"),
+            }
+            if cfg.join_token.is_some() {
+                println!("Join token:  [set, not printed]");
+            }
+        }
+        Err(LocalError::NotFound { .. }) => {
+            println!("Overlay:     (not configured; pass --ip on join/connect)");
+        }
+        Err(e) => return Err(e.into()),
+    }
+    let list = PeerList::load_from(&peers_path_in(dir))?;
+    let sessions = SessionTable::load_from(&session_path_in(dir)).unwrap_or_default();
+    println!("Trusted:     {} peer(s)", list.peers().len());
+    for peer in list.peers() {
+        let pk = peer.public_key.to_base64();
+        let state = sessions
+            .get(&pk)
+            .map(|r| r.state)
+            .unwrap_or(PeerState::Disconnected);
+        println!(
+            "  {}  {}  {}  {}",
+            peer.display_name(),
+            peer.virtual_ip,
+            peer.endpoint
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "(no endpoint)".into()),
+            state
+        );
     }
     Ok(())
 }
@@ -515,6 +829,7 @@ mod tests {
         let help = cmd.render_long_help().to_string();
         for needle in [
             "version", "init", "identity", "peer", "tun-test", "connect", "disconnect", "export",
+            "join", "sync", "status",
         ] {
             assert!(help.contains(needle), "help missing {needle}");
         }

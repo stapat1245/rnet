@@ -1,0 +1,40 @@
+# mynet coordinator (control plane only).
+# Overlay / WireGuard UDP does not go through this service.
+#
+# On the VPS, copy `.env.example` to `.env` and set MYNET_JOIN_TOKEN.
+# Publish TCP MYNET_COORD_PORT. Laptops use VPS_PUBLIC_IP:MYNET_COORD_PORT
+# with `mynet join --coordinator ...` — see execution.md.
+
+services:
+  coordinator:
+    build:
+      context: .
+      dockerfile: deploy/coordinator/Dockerfile
+    image: mynet-coordinator:local
+    container_name: mynet-coordinator
+    restart: unless-stopped
+    ports:
+      - "${MYNET_COORD_PORT:-9993}:9993"
+    environment:
+      MYNET_LISTEN: "0.0.0.0:9993"
+      MYNET_JOIN_TOKEN: "${MYNET_JOIN_TOKEN:-}"
+      MYNET_NETWORK: "${MYNET_NETWORK:-mynet}"
+      MYNET_STATE_PATH: "/var/lib/mynet/state.toml"
+    volumes:
+      - coordinator-state:/var/lib/mynet
+
+  relay:
+    profiles: ["relay"]
+    build:
+      context: .
+      dockerfile: deploy/relay/Dockerfile
+    image: mynet-relay:local
+    container_name: mynet-relay
+    restart: unless-stopped
+    ports:
+      - "${MYNET_RELAY_PORT:-9994}:9994/udp"
+    environment:
+      MYNET_LISTEN: "0.0.0.0:9994"
+
+volumes:
+  coordinator-state:

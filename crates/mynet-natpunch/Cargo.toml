@@ -1,0 +1,23 @@
+[package]
+name = "mynet-natpunch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Standalone UDP hole-punch experiment (not the VPN data path)"
+
+[[bin]]
+name = "mynet-natpunch"
+path = "src/main.rs"
+
+[lib]
+name = "mynet_natpunch"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+mynet-core = { path = "../mynet-core" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -252,6 +252,63 @@ fn export_then_peer_import() {
 }
 
 #[test]
+fn status_after_init_hides_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(run_in(dir.path(), &["init"]).status.success());
+    let st = run_in(dir.path(), &["status"]);
+    assert!(st.status.success(), "stderr: {}", stderr(&st));
+    let out = stdout(&st);
+    assert!(out.contains("Peer ID:"));
+    assert!(out.contains("Public Key:"));
+    assert!(out.contains("Overlay:") || out.contains("Coordinator:"));
+    assert!(!out.to_lowercase().contains("private"));
+    assert!(!out.contains("Join token:"));
+}
+
+#[test]
+fn join_refuses_unreachable_coordinator() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(run_in(dir.path(), &["init"]).status.success());
+    let out = run_in(
+        dir.path(),
+        &[
+            "join",
+            "--coordinator",
+            "127.0.0.1:1",
+            "--token",
+            "lab-token",
+            "--ip",
+            "10.42.0.1",
+        ],
+    );
+    assert!(!out.status.success());
+    let err = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(
+        err.contains("Connection refused")
+            || err.contains("connect")
+            || err.contains("os error")
+            || err.contains("control-plane"),
+        "{err}"
+    );
+    let local = fs::read_to_string(dir.path().join("local.toml")).unwrap();
+    assert!(local.contains("127.0.0.1:1"));
+    assert!(local.contains("lab-token"));
+}
+
+#[test]
+fn help_lists_join_sync_status() {
+    let output = Command::new(mynet_bin())
+        .arg("--help")
+        .output()
+        .expect("help");
+    assert!(output.status.success());
+    let stdout = stdout(&output);
+    assert!(stdout.contains("join"));
+    assert!(stdout.contains("sync"));
+    assert!(stdout.contains("status"));
+}
+
+#[test]
 fn tun_test_without_cap_fails_cleanly() {
     let dir = tempfile::tempdir().unwrap();
     let out = run_in(

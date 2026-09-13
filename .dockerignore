@@ -1,0 +1,10 @@
+/target
+.git
+.gitignore
+**/*.md
+!README.md
+.env
+.env.*
+deploy
+docker-compose.yml
+execution.md

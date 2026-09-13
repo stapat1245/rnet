@@ -3,6 +3,7 @@
 //! Virtual IP is an address on the overlay, not identity. Listen port and
 //! interface name are transport/virtual-network configuration.
 
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::net::Ipv4Addr;
@@ -16,12 +17,33 @@ use crate::{DEFAULT_INTERFACE, DEFAULT_LISTEN_PORT};
 const SCHEMA_VERSION: u32 = 1;
 const FILE_MODE: u32 = 0o600;
 
-/// This node's overlay address and data-plane bind settings.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// This node's overlay address, data-plane bind, and optional coordinator.
+///
+/// `join_token` is a membership secret. It is stored mode `0600` and redacted
+/// from `Debug`. It is never a WireGuard key and never sent on the data plane.
+#[derive(Clone, PartialEq, Eq)]
 pub struct LocalConfig {
     pub virtual_ip: Ipv4Addr,
     pub listen_port: u16,
     pub interface: String,
+    pub coordinator: Option<String>,
+    pub network: Option<String>,
+    pub join_token: Option<String>,
+    pub relay: Option<String>,
+}
+
+impl fmt::Debug for LocalConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalConfig")
+            .field("virtual_ip", &self.virtual_ip)
+            .field("listen_port", &self.listen_port)
+            .field("interface", &self.interface)
+            .field("coordinator", &self.coordinator)
+            .field("network", &self.network)
+            .field("join_token", &self.join_token.as_ref().map(|_| "[redacted]"))
+            .field("relay", &self.relay)
+            .finish()
+    }
 }
 
 impl LocalConfig {
@@ -35,6 +57,10 @@ impl LocalConfig {
             virtual_ip,
             listen_port,
             interface,
+            coordinator: None,
+            network: None,
+            join_token: None,
+            relay: None,
         })
     }
 
@@ -68,7 +94,18 @@ impl LocalConfig {
             path: path.to_path_buf(),
             reason: format!("invalid virtual_ip {}", parsed.virtual_ip),
         })?;
-        Self::new(ip, parsed.listen_port, parsed.interface)
+        let mut cfg = Self::new(ip, parsed.listen_port, parsed.interface)?;
+        cfg.coordinator = normalize_opt(parsed.coordinator);
+        cfg.network = normalize_opt(parsed.network);
+        cfg.join_token = normalize_opt(parsed.join_token);
+        cfg.relay = normalize_opt(parsed.relay);
+        if let Some(ref coord) = cfg.coordinator {
+            validate_host_port(coord)?;
+        }
+        if let Some(ref relay) = cfg.relay {
+            validate_host_port(relay)?;
+        }
+        Ok(cfg)
     }
 
     pub fn save_to(&self, path: &Path) -> Result<(), LocalError> {
@@ -85,6 +122,10 @@ impl LocalConfig {
             virtual_ip: self.virtual_ip.to_string(),
             listen_port: self.listen_port,
             interface: self.interface.clone(),
+            coordinator: self.coordinator.clone(),
+            network: self.network.clone(),
+            join_token: self.join_token.clone(),
+            relay: self.relay.clone(),
         };
         let serialized = toml::to_string_pretty(&file).map_err(|source| LocalError::Serialize {
             path: path.to_path_buf(),
@@ -121,6 +162,10 @@ impl Default for LocalConfig {
             virtual_ip: Ipv4Addr::new(10, 42, 0, 1),
             listen_port: DEFAULT_LISTEN_PORT,
             interface: DEFAULT_INTERFACE.to_string(),
+            coordinator: None,
+            network: None,
+            join_token: None,
+            relay: None,
         }
     }
 }
@@ -131,6 +176,14 @@ struct FileOnDisk {
     virtual_ip: String,
     listen_port: u16,
     interface: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coordinator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    join_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -157,6 +210,8 @@ pub enum LocalError {
     InvalidListenPort,
     #[error("interface name {0:?} is invalid; use 1-15 ASCII [A-Za-z0-9_-]")]
     InvalidInterface(String),
+    #[error("coordinator must be host:port (got {0:?})")]
+    InvalidCoordinator(String),
 }
 
 fn validate_overlay_ip(ip: Ipv4Addr) -> Result<(), LocalError> {
@@ -165,6 +220,38 @@ fn validate_overlay_ip(ip: Ipv4Addr) -> Result<(), LocalError> {
         return Err(LocalError::InvalidVirtualIp(ip));
     }
     Ok(())
+}
+
+fn normalize_opt(value: Option<String>) -> Option<String> {
+    value.and_then(|s| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    })
+}
+
+/// Split `host:port` on the last colon. Hostnames are allowed; IPv6 is not.
+pub fn split_host_port(s: &str) -> Result<(&str, u16), LocalError> {
+    let s = s.trim();
+    let idx = s.rfind(':').ok_or_else(|| LocalError::InvalidCoordinator(s.to_string()))?;
+    let host = &s[..idx];
+    let port: u16 = s[idx + 1..]
+        .parse()
+        .map_err(|_| LocalError::InvalidCoordinator(s.to_string()))?;
+    if host.is_empty() || port == 0 {
+        return Err(LocalError::InvalidCoordinator(s.to_string()));
+    }
+    if host.starts_with('[') {
+        return Err(LocalError::InvalidCoordinator(s.to_string()));
+    }
+    Ok((host, port))
+}
+
+fn validate_host_port(s: &str) -> Result<(), LocalError> {
+    split_host_port(s).map(|_| ())
 }
 
 pub(crate) fn validate_iface(name: &str) -> Result<(), LocalError> {
@@ -201,5 +288,49 @@ mod tests {
     #[test]
     fn rejects_off_overlay() {
         assert!(LocalConfig::new("8.8.8.8".parse().unwrap(), 51820, "mynet0".into()).is_err());
+    }
+
+    #[test]
+    fn coordinator_fields_round_trip_and_debug_redacts_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local.toml");
+        let mut cfg = LocalConfig::new(
+            "10.42.0.1".parse().unwrap(),
+            51820,
+            "mynet0".into(),
+        )
+        .unwrap();
+        cfg.coordinator = Some("203.0.113.10:9993".into());
+        cfg.network = Some("office".into());
+        cfg.join_token = Some("super-secret-token".into());
+        cfg.save_to(&path).unwrap();
+        let loaded = LocalConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.coordinator.as_deref(), Some("203.0.113.10:9993"));
+        assert_eq!(loaded.join_token.as_deref(), Some("super-secret-token"));
+        let debug = format!("{loaded:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("super-secret-token"));
+    }
+
+    #[test]
+    fn old_local_toml_without_coordinator_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local.toml");
+        std::fs::write(
+            &path,
+            "schema_version = 1\nvirtual_ip = \"10.42.0.2\"\nlisten_port = 51820\ninterface = \"mynet0\"\n",
+        )
+        .unwrap();
+        let loaded = LocalConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.virtual_ip, Ipv4Addr::new(10, 42, 0, 2));
+        assert!(loaded.coordinator.is_none());
+        assert!(loaded.join_token.is_none());
+    }
+
+    #[test]
+    fn split_host_port_ipv4() {
+        let (host, port) = split_host_port("203.0.113.9:8443").unwrap();
+        assert_eq!(host, "203.0.113.9");
+        assert_eq!(port, 8443);
     }
 }

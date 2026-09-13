@@ -13,7 +13,7 @@ mynet is not a Tailscale clone. It is a small, understandable Linux VPN built fr
 * Traffic between peers is encrypted with **kernel WireGuard**.
 * Peers communicate directly over UDP whenever possible.
 * A coordination server, if present, is for discovery only. It is never the VPN data path.
-* A relay may be added later as a fallback when direct P2P is impossible.
+* A relay may be used as a fallback when direct P2P is impossible (`mynet-relay`, two peers).
 
 ## Status
 
@@ -28,7 +28,16 @@ See [`plan.md`](plan.md) for the living implementation plan.
 | 4 | Two-host TUN+UDP | IMPLEMENTED (`--plain`, needs sudo) |
 | 5 | Kernel WireGuard | IMPLEMENTED (`mynet connect`, needs sudo) |
 | 6 | Manual peer exchange | COMPLETE (`export` / `peer import`) |
-| 7–16 | Handshake hardening, coordinator, NAT, relay | NOT STARTED |
+| 7 | Identity association | IMPLEMENTED (unknown keys / IP mismatch rejected) |
+| 8 | Coordinator | IMPLEMENTED (`mynet-coordinator`, Docker; control plane only) |
+| 9 | Endpoint discovery | IMPLEMENTED (`join` / `sync`; live WG reconnect not verified) |
+| 10 | NAT / hole punch | IMPLEMENTED (`mynet-natpunch`; two real NATs not tested) |
+| 11 | Session state machine | IMPLEMENTED (`session.toml`; live handshake not verified) |
+| 12 | Keepalives | IMPLEMENTED (WG 25s + coordinator sync 30s) |
+| 13 | Pair UDP relay | IMPLEMENTED (`mynet-relay`; live failover not run) |
+| 14 | Overlay addresses | IMPLEMENTED (`--ip` or `join --allocate`) |
+| 15 | Host overlay route | IMPLEMENTED (`10.42.0.0/24 dev mynet0`) |
+| 16 | Operator CLI | IMPLEMENTED (`status` shows per-peer state) |
 
 ## Requirements
 
@@ -56,14 +65,20 @@ mynet peer list
 mynet peer remove bob
 mynet export --ip 10.42.0.1 --endpoint HOST:PORT
 mynet peer import alice.toml --name alice
-sudo mynet tun-test --ip 10.42.0.1 --duration 0
+mynet join --coordinator VPS_IP:9993 --token TOKEN --ip 10.42.0.1
+mynet join --coordinator VPS_IP:9993 --token TOKEN --allocate
+mynet sync
+mynet status
 sudo mynet connect --ip 10.42.0.1
+sudo mynet connect --relay VPS_IP:9994
 sudo mynet disconnect
 ```
 
 `mynet identity` prints the peer ID and public key. It never prints the private key.
 
-Config lives in `$MYNET_CONFIG_DIR` or `$XDG_CONFIG_HOME/mynet` (`identity.toml` and `peers.toml`, mode `0600`).
+Config lives in `$MYNET_CONFIG_DIR` or `$XDG_CONFIG_HOME/mynet` (`identity.toml`, `peers.toml`, `local.toml`, mode `0600`).
+
+To run the optional coordinator on a VPS, see [`execution.md`](execution.md). Short version: `.env` next to `docker-compose.yml` gets `MYNET_COORD_PORT` and `MYNET_JOIN_TOKEN`; laptops pass `VPS_IP:PORT` to `mynet join`.
 
 ## Architecture in one picture
 
@@ -91,6 +106,8 @@ Identity is a public key. An IP address or UDP endpoint is never identity.
 
 * [`plan.md`](plan.md) — phases, exit criteria, current status
 * [`notes.md`](notes.md) — architecture decisions, Linux notes, commands, experiments
+* [`execution.md`](execution.md) — what to run on a VPS vs laptops, Docker, where IP/port go
+* [`test.md`](test.md) — Alice / Bob / VPS hands-on test checklist
 
 ## License
 

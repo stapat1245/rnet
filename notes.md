@@ -25,7 +25,7 @@ Phase 0 started with `mynet-cli` and `mynet-core`. Phase 1 added `mynet-identity
 ### Serialization
 
 * Local config: TOML (`toml` 0.5.11). Newer `toml` 0.8.x depends on `toml_edit`/`indexmap` releases whose manifests require edition 2024.
-* Control-plane messages (later): `serde` + `bincode` or a similarly explicit binary format. Choice will be recorded when Phase 8 starts. Do not invent a complex wire protocol.
+* Control-plane messages: length-prefixed TOML over TCP (`mynet-protocol`). No bincode. No overlay-packet message type.
 
 ### Logging
 
@@ -126,7 +126,7 @@ Phase 1 (implemented):
 
 ## Trusted peers
 
-**Trusted** means the operator ran `mynet peer add` with that public key. It is a local authorization entry in `peers.toml` (mode `0600`).
+**Trusted** means the operator ran `mynet peer add` / `peer import`, or `mynet join` with a coordinator token (membership for that network). It is a local authorization entry in `peers.toml` (mode `0600`).
 
 It is **not**:
 
@@ -140,7 +140,9 @@ Duplicate public keys and duplicate overlay IPs are rejected. Overlay IPs must b
 
 ## Routing
 
-Not implemented. Target: `10.42.0.0/24 dev mynet0`. Install on connect, remove on disconnect, document conflicts. Kernel WireGuard also uses AllowedIPs as its cryptokey routing table — that is distinct from the host `ip route` table and must stay documented as such.
+Target: `10.42.0.0/24 dev mynet0`. `ip addr replace 10.42.0.1/24 dev mynet0` already installs a kernel connected route for that prefix. Phase 15 also runs `ip route replace 10.42.0.0/24 dev mynet0` so the overlay path is explicit and leftover routes after a crash are repaired. `mynet disconnect` deletes the link, which drops the route. Conflicts: do not use `10.42.0.0/24` on a physical NIC or Docker bridge on the same host.
+
+Kernel WireGuard AllowedIPs (`/32` per peer) are cryptokey routing, distinct from the host `ip route` table.
 
 ## UDP Notes
 
@@ -162,19 +164,111 @@ Identity != discovery != transport != encryption:
 
 ## NAT Traversal Notes
 
-Not started. Phase 10 requires a written NAT model **before** code. Do not assume hole punching works for symmetric NAT.
+Written before Phase 10 code. This is the model mynet uses. It is not a claim that hole punching works on every NAT.
+
+### What NAT does to us
+
+A laptop behind a router typically has a private IPv4 (`192.168.x.x`, `10.x`, `100.64.x`). WireGuard binds UDP `51820` on that private address. The peer cannot send to `192.168.1.50:51820` from the internet.
+
+The router maps `{private_ip, private_port, proto}` to `{public_ip, public_port}` for outbound UDP. Return traffic is allowed only according to the NAT type.
+
+**Identity is still the public key.** A mapped `203.0.113.9:41234` is discovery data. It will change when the laptop sleeps, the WAN IP changes, or the mapping expires.
+
+### NAT types (practical, not RFC 3489 pedantry)
+
+| Type | Mapping | Who may send back | Hole punch |
+| --- | --- | --- | --- |
+| No NAT / public IP | 1:1 | Anyone to that IP:port | Not needed |
+| Full cone | One WAN port for the LAN socket, all dests | Anyone to that WAN port | Easy |
+| Address-restricted cone | One WAN port for all dests | Only IPs this socket has sent to | Both sides send |
+| Port-restricted cone | One WAN port for all dests | Only IP:port this socket has sent to | Both sides send to the mapped port |
+| Symmetric | **New WAN port per destination** | Only that destination | Usually **fails** |
+
+"Both sides send" is UDP hole punching: Alice and Bob learn a candidate WAN `IP:port` (from a rendezvous that saw their UDP), then each send UDP to the other's candidate. That creates the missing NAT mapping toward the peer.
+
+### Why the coordinator's TCP view is not a hole punch
+
+`mynet join` is TCP to the VPS. The coordinator records `observed_tcp_ip:listen_port` (default listen_port `51820`) unless `--endpoint` is set.
+
+That is wrong for many NATs:
+
+* The TCP source port is not the WireGuard UDP port.
+* Even the public IP may differ from the UDP mapping (CGNAT, dual-WAN).
+* Symmetric NAT gives a **different** WAN port for the coordinator than for the peer.
+
+So Phase 8–9 discovery is "a hint". It is enough on a LAN, a VPS with a public IP, or a laptop with an explicit UDP port-forward. It is **not** NAT traversal.
+
+### Kernel WireGuard constraint
+
+Kernel WireGuard owns UDP `51820`. mynet cannot bind that port for STUN while WG is up. A STUN transaction from some other local port tells you a **different** mapping than WG's.
+
+What actually keeps a WG NAT binding alive is **`persistent-keepalive 25`** (Phase 5 already sets this). That is a data-plane keepalive from the WG socket, not a coordinator trick.
+
+Hole punching for WG is: set `endpoint` to the peer's candidate, send a handshake/keepalive, hope the other side does the same. mynet does not multiplex a custom STUN on 51820.
+
+### Standalone experiment (Phase 10)
+
+`mynet-natpunch` is a **separate** UDP experiment. It does not carry overlay packets and does not talk to kernel WireGuard.
+
+* Rendezvous: records the UDP source of a HELLO (this *is* the mapped port for **that** socket).
+* Two peers: learn each other's mapped address, send PUNCH datagrams.
+* Same host / same LAN: should succeed (no NAT).
+* Simulated cone vs symmetric mappings: cone+cone punch is forecast **possible**; symmetric+symmetric is forecast **fail**.
+
+This lab is one machine with no second distinct NAT. Real two-NAT tests are **not run**. Failures of symmetric NAT are recorded from the mapping model, not from a field trial.
+
+### What mynet will and will not promise
+
+* Direct P2P on a LAN or with a port-forward: expected to work (Phase 5), still needs root to verify here.
+* Two port-restricted cones: possible after a UDP-mapped rendezvous; not claimed until tested.
+* Symmetric NAT: treat as **fail**, use relay (Phase 13) or a manual port-forward.
+* Do not invent port prediction for symmetric NAT.
 
 ## Coordination Protocol
 
-Not started. Coordinator is optional, stores no VPN payload, and is not the data path.
+Optional. Control plane only. Binary: `mynet-coordinator`. Docker: `docker compose up` (see `execution.md`).
+
+Wire format: TCP, one request per connection, `u32` big-endian length + UTF-8 TOML. Kinds: `register`, `discover`, `allocate`, `ok`, `error`. There is **no** forward/proxy kind. Max frame 64 KiB.
+
+Default listen: `0.0.0.0:9993` (`MYNET_LISTEN`). Membership: `MYNET_JOIN_TOKEN`. Empty token = open lab coordinator (anyone can register).
+
+Stored per member: public key, overlay IPv4, UDP endpoint, last_seen. Never private keys. Never payloads.
+
+Register is also the heartbeat. The client may send `endpoint = "A.B.C.D:51820"` (WireGuard UDP). If omitted, the server records `observed_tcp_ip:listen_port`.
+
+Identity association: the same public key cannot change overlay IP; the same overlay IP cannot be claimed by a second key.
+
+Clients: `mynet join --coordinator HOST:PORT --token TOKEN --ip 10.42.0.N` (or `--allocate`) then `mynet sync`. `mynet connect` syncs first if a coordinator is configured, and every ~30s while up. Coordinator outage does not tear down WireGuard.
+
+`allocate` returns the next free `10.42.0.1`–`.254`. Duplicate overlay IPs are still rejected on register.
+
+## Session state
+
+Live states are not stored in `peers.toml`. While `mynet connect` runs they live in `session.toml` (mode `0600`, deleted on disconnect):
+
+`Disconnected → Discovering → Connecting → Direct | Relaying | Failed`
+
+Every transition is traced. `Connecting` becomes `Direct` when `wg show latest-handshakes` is non-zero. After 15s without a handshake, the peer goes `Failed`, or `Relaying` if `--relay` is set.
+
+## Pair relay
+
+`mynet-relay` is **not** the coordinator. It copies opaque UDP datagrams between the last two source addresses. Kernel WireGuard can use it for **two** nodes by setting both endpoints to the relay. A third peer cannot be demuxed (WG packets have no extra dest header). The relay never sees private keys and does not parse payloads.
+
+Failover: `sudo mynet connect --relay VPS_IP:9994`. If the direct handshake times out, endpoints are switched to the relay.
+
+VPS IP:port go in (1) Docker `.env` as `MYNET_COORD_PORT` on the server, (2) laptop `mynet join --coordinator VPS_IP:PORT` which writes `local.toml`. Details in `execution.md`.
 
 ## Security Model
 
-Trust is a public key that an operator explicitly added with `mynet peer add`. That writes `peers.toml`. It is **not** a handshake. Live overlay traffic must still prove possession of the corresponding private key (WireGuard, Phase 5/7). IP, hostname, UDP endpoint, and nickname are locators or labels, never identity.
+Trust is a public key in `peers.toml`. Sources: explicit `peer add` / `peer import`, or `join`/`sync` against a coordinator while holding the join token. That token is a membership credential, not a WireGuard key.
 
-WireGuard provides handshake authentication, replay protection, and forward secrecy for the data plane. mynet must not invent packet counters or nonces.
+Live overlay traffic must still prove possession of the corresponding private key (kernel WireGuard). IP, hostname, UDP endpoint, and nickname are locators or labels, never identity. A known key cannot silently change its overlay IP (`VirtualIpMismatch`). Unknown keys are not added except during join/sync with the token.
 
-Private keys stay local. Coordinator compromise (future) must not yield overlay plaintext.
+WireGuard provides handshake authentication, replay protection, and forward secrecy for the data plane. mynet does not invent packet counters or nonces. AllowedIPs are the trusted `/32` mapping for that public key.
+
+Private keys stay local. Coordinator compromise yields public keys and endpoints, not overlay plaintext and not private keys. A stolen join token lets an attacker register as a new member.
+
+`--plain` is unauthenticated UDP. Anyone who can send UDP can forge those headers.
 
 `/dev/net/tun` world-writable on this host: anyone local can open the device node; they still cannot `TUNSETIFF` without `CAP_NET_ADMIN`. Still worth tightening on a real deployment host (`root:root 0660` plus a dedicated group).
 
@@ -208,9 +302,28 @@ cargo run -p mynet-cli -- --config-dir /tmp/mynet-a peer list
 cargo run -p mynet-cli -- --config-dir /tmp/mynet-a export --ip 10.42.0.1 --endpoint 192.0.2.10:51820
 cargo run -p mynet-cli -- --config-dir /tmp/mynet-b peer import /tmp/alice.toml --name alice
 
+# Phase 8 / 9 (coordinator)
+cargo run -p mynet-coordinator
+# or on a VPS: docker compose up -d --build  (see execution.md)
+cargo run -p mynet-cli -- --config-dir /tmp/mynet-a init
+cargo run -p mynet-cli -- --config-dir /tmp/mynet-a join --coordinator 127.0.0.1:9993 --token lab --ip 10.42.0.1
+cargo run -p mynet-cli -- --config-dir /tmp/mynet-a join --coordinator 127.0.0.1:9993 --token lab --allocate
+cargo run -p mynet-cli -- --config-dir /tmp/mynet-a status
+cargo run -p mynet-cli -- --config-dir /tmp/mynet-a sync
+
+# Phase 10 (standalone hole punch, not the VPN)
+cargo run -p mynet-natpunch -- rendezvous --bind 127.0.0.1:3478
+cargo run -p mynet-natpunch -- peer --rendezvous 127.0.0.1:3478 --id alice
+
+# Phase 13 (optional pair relay)
+cargo run -p mynet-relay
+# MYNET_LISTEN=0.0.0.0:9994
+# docker compose --profile relay up -d
+
 # Phase 3 / 5 (root)
 sudo mynet tun-test --ip 10.42.0.1 --duration 0
 sudo mynet connect --ip 10.42.0.1
+sudo mynet connect --relay 192.0.2.10:9994
 sudo mynet disconnect
 
 # Environment
@@ -239,6 +352,12 @@ ls -l /dev/net/tun
 | `cargo test --workspace` after Phase 6 | 51 passed, `-D warnings` clean |
 | `mynet tun-test` unprivileged | Fails with CAP_NET_ADMIN / no TUN node (expected) |
 | `mynet export` / `peer import` | Round-trip; no private key in export |
+| `cargo test --workspace` after Phase 9 | 70 passed, `-D warnings` clean |
+| Coordinator register/discover | Two peers see each other's public keys and endpoints; bad token rejected; no `forward` kind |
+| `cargo test --workspace` after Phase 16 | 85 passed, `-D warnings` clean |
+| Simulated cone vs symmetric punch | Cone+cone succeeds in the mapping model; symmetric+symmetric fails (recorded) |
+| Localhost UDP hole punch | Protocol round-trip on 127.0.0.1 |
+| Pair relay opaque forward | Bytes copied unchanged; third source ignored |
 
 ## Known Problems
 

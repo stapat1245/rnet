@@ -17,6 +17,7 @@ clap = { workspace = true }
 libc = { workspace = true }
 mynet-core = { path = "../mynet-core" }
 mynet-identity = { path = "../mynet-identity" }
+mynet-protocol = { path = "../mynet-protocol" }
 mynet-transport = { path = "../mynet-transport" }
 mynet-vpn = { path = "../mynet-vpn" }
 serde = { workspace = true }

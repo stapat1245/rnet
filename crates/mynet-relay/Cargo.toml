@@ -1,0 +1,23 @@
+[package]
+name = "mynet-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Optional two-peer UDP relay (opaque packets only)"
+
+[[bin]]
+name = "mynet-relay"
+path = "src/main.rs"
+
+[lib]
+name = "mynet_relay"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+mynet-core = { path = "../mynet-core" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

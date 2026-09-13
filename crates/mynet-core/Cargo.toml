@@ -13,6 +13,7 @@ mynet-identity = { path = "../mynet-identity" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
+tracing = { workspace = true }
 
 # rustc 1.75 cannot parse edition-2024 manifests. These pins keep the
 # workspace lockfile on crates this Cargo can download and compile.

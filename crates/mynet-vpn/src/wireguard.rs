@@ -15,6 +15,7 @@ use base64::Engine;
 use zeroize::Zeroize;
 
 use crate::tun::{find_ip, ip, TunError};
+use mynet_core::WG_PERSISTENT_KEEPALIVE_SECS;
 
 #[derive(Clone, Debug)]
 pub struct WgPeer {
@@ -72,7 +73,7 @@ pub fn apply_wireguard(
             args.push("endpoint".into());
             args.push(ep.to_string());
             args.push("persistent-keepalive".into());
-            args.push("25".into());
+            args.push(WG_PERSISTENT_KEEPALIVE_SECS.to_string());
         }
     }
     let result = wg(args.iter().map(|s| s.as_str()).collect::<Vec<_>>().as_slice());
@@ -82,6 +83,7 @@ pub fn apply_wireguard(
     let cidr = format!("{addr}/{prefix}");
     ip(&["addr", "replace", &cidr, "dev", iface])?;
     ip(&["link", "set", "dev", iface, "up"])?;
+    crate::tun::install_overlay_route(iface)?;
     tracing::info!(
         interface = %iface,
         listen_port,
@@ -123,10 +125,108 @@ pub fn wg_set_args(
             args.push("endpoint".into());
             args.push(ep.to_string());
             args.push("persistent-keepalive".into());
-            args.push("25".into());
+            args.push(WG_PERSISTENT_KEEPALIVE_SECS.to_string());
         }
     }
     args
+}
+
+/// Add or update one WireGuard peer without rewriting the private key.
+pub fn upsert_wg_peer(iface: &str, peer: &WgPeer) -> Result<(), WgError> {
+    ensure_wg()?;
+    let args = upsert_wg_peer_args(iface, peer);
+    wg(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+}
+
+pub fn upsert_wg_peer_args(iface: &str, peer: &WgPeer) -> Vec<String> {
+    let mut args = vec![
+        "set".into(),
+        iface.into(),
+        "peer".into(),
+        peer.public_key_base64.clone(),
+        "allowed-ips".into(),
+        format!("{}/32", peer.allowed_ip),
+    ];
+    if let Some(ep) = peer.endpoint {
+        args.push("endpoint".into());
+        args.push(ep.to_string());
+        args.push("persistent-keepalive".into());
+        args.push(WG_PERSISTENT_KEEPALIVE_SECS.to_string());
+    }
+    args
+}
+
+pub fn set_peer_endpoint_args(
+    iface: &str,
+    public_key_base64: &str,
+    endpoint: SocketAddr,
+) -> Vec<String> {
+    vec![
+        "set".into(),
+        iface.into(),
+        "peer".into(),
+        public_key_base64.into(),
+        "endpoint".into(),
+        endpoint.to_string(),
+        "persistent-keepalive".into(),
+        WG_PERSISTENT_KEEPALIVE_SECS.to_string(),
+    ]
+}
+
+/// Parse `wg show <iface> latest-handshakes`. Does not include private keys.
+pub fn wg_latest_handshakes(iface: &str) -> Result<Vec<(String, u64)>, WgError> {
+    let bin = find_wg()?;
+    let out = Command::new(&bin)
+        .args(["show", iface, "latest-handshakes"])
+        .output()
+        .map_err(|e| WgError::WgFailed {
+            args: vec!["show".into(), iface.into(), "latest-handshakes".into()],
+            stderr: e.to_string(),
+        })?;
+    if !out.status.success() {
+        return Err(WgError::WgFailed {
+            args: vec!["show".into(), iface.into(), "latest-handshakes".into()],
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        });
+    }
+    Ok(parse_latest_handshakes(&String::from_utf8_lossy(&out.stdout)))
+}
+
+pub fn parse_latest_handshakes(text: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(pk) = parts.next() else { continue };
+        let Some(ts) = parts.next() else { continue };
+        if let Ok(unix) = ts.parse::<u64>() {
+            out.push((pk.to_string(), unix));
+        }
+    }
+    out
+}
+
+/// Best-effort primary IPv4 from `ip route get 1.1.1.1` (`src` field).
+pub fn primary_ipv4() -> Option<Ipv4Addr> {
+    let bin = find_ip().ok()?;
+    let out = Command::new(bin).args(["-4", "route", "get", "1.1.1.1"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_src_ipv4(&String::from_utf8_lossy(&out.stdout))
+}
+
+pub fn parse_src_ipv4(text: &str) -> Option<Ipv4Addr> {
+    let mut toks = text.split_whitespace();
+    while let Some(t) = toks.next() {
+        if t == "src" {
+            return toks.next().and_then(|s| s.parse().ok());
+        }
+    }
+    None
 }
 
 fn write_private_key(key: &[u8; 32]) -> Result<PathBuf, WgError> {
@@ -207,5 +307,35 @@ mod tests {
         assert!(args.contains(&"25".to_string()));
         assert!(args.contains(&"private-key".to_string()));
         assert!(args.contains(&"/tmp/k".to_string()));
+    }
+
+    #[test]
+    fn endpoint_update_does_not_include_private_key() {
+        let args = set_peer_endpoint_args(
+            "mynet0",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "203.0.113.8:51820".parse().unwrap(),
+        );
+        assert!(args.contains(&"203.0.113.8:51820".to_string()));
+        assert!(!args.iter().any(|a| a.contains("private-key")));
+        assert_eq!(args[3], "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        assert!(args.contains(&WG_PERSISTENT_KEEPALIVE_SECS.to_string()));
+    }
+
+    #[test]
+    fn parse_handshake_lines() {
+        let text = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\t1700000000\n";
+        let rows = parse_latest_handshakes(text);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, 1_700_000_000);
+    }
+
+    #[test]
+    fn parse_src_from_ip_route_get() {
+        let sample = "1.1.1.1 via 192.168.1.1 dev wlp62s0 src 192.168.1.50 uid 1000\n";
+        assert_eq!(
+            parse_src_ipv4(sample).unwrap(),
+            Ipv4Addr::new(192, 168, 1, 50)
+        );
     }
 }

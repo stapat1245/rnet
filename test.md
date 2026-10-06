@@ -40,6 +40,81 @@ VPN packets must go **Alice ↔ Bob** (or Alice ↔ relay ↔ Bob). They must **
 
 ---
 
+## Laptop + Kali VM (same NAT)
+
+This is the usual home-lab layout: **Alice = host Linux**, **Bob = Kali VM** (VMware/VirtualBox NAT or host-only). Both share one public IP. Do **not** put that WAN address in `--endpoint`. WireGuard must use the **VM-network / LAN IPs** so packets stay on the virtual switch.
+
+### VirtualBox: Internal Network or NAT (`10.0.2.15`)
+
+`10.0.2.15/24` is VirtualBox **NAT**, not a LAN the host sits on. From the guest, the host is usually `10.0.2.2`. From the host, `ping 10.0.2.15` almost always fails. **Internal Network** is even stricter: only VMs on that name see each other; the host has no iface there.
+
+Alice (host) and Bob (Kali) cannot run a VPN until they have **mutual IPv4 ping**. Add a second NIC:
+
+1. VM settings → Network → **Adapter 2** → enable → **Host-only Adapter** (`vboxnet0`). Keep Adapter 1 as NAT if you want Kali to reach the VPS (`172.197.216.135:9993`).
+2. Start Kali, then `ip -4 addr`. You want a new address such as `192.168.56.101`.
+3. On the host: `ip -4 addr show vboxnet0` (often `192.168.56.1`).
+4. `ping` host↔Kali on those `192.168.56.x` addresses. Only then join/connect.
+5. Kali needs `wireguard-tools`. For **internet** (two different networks), both machines need the VPS reachable on TCP 9993 and UDP 9994, and the starter needs `~/.config/mynet/discovery.toml`:
+
+```bash
+coordinator = "172.197.216.135:9993"
+relay = "172.197.216.135:9994"
+```
+
+**Starter (any network)**
+
+```bash
+sudo rnet start
+```
+
+**Joiner (any other network)**
+
+```bash
+sudo rnet connect rnet1.…
+```
+
+Leave both running until Ctrl-C. Overlay ping `10.42.0.1` ↔ `10.42.0.2`. Direct WireGuard is tried first; NAT pairs fall back to the VPS relay.
+
+The older `mynet join --coordinator …` flow still works. `sudo` must keep the user's config, not `/root/.config/mynet`.
+
+Bridged adapter on the home Wi-Fi also works (both get `192.168.1.x` / `192.168.0.x`). Do not use `curl ifconfig.me` (`103.85.126.24`) as `--endpoint` for this pair.
+
+1. Call the host IP `ALICE_LAN` and the VM IP `BOB_LAN` (the host-only or bridged addresses, not `10.0.2.15`). Overlay stays `10.42.0.1` / `10.42.0.2` (must not be the same prefix as `ALICE_LAN`).
+2. `mynet join --endpoint ALICE_LAN:51820` on the host, `BOB_LAN:51820` on Kali.
+3. If `mynet join` to the VPS times out, skip the coordinator and use **Test 3 (manual export/import)** with those LAN endpoints. You can still prove Alice↔Bob ping. Fix TCP 9993 later (next section).
+
+---
+
+## Join times out (`connection timed out`)
+
+`docker ps` showing `0.0.0.0:9993->9993/tcp` only proves the container listens **on the VPS**. A timeout from your laptop means something in front of Docker is dropping TCP 9993 (UFW, iptables, or the cloud **security group** / firewall).
+
+On the **VPS**:
+
+```bash
+ss -lnt | grep 9993
+sudo ufw allow 9993/tcp
+sudo ufw status
+# if ufw is inactive, check iptables / nft:
+sudo iptables -L INPUT -n | head
+# cloud panels (Oracle, AWS, GCP, DO, Hetzner): add inbound TCP 9993 from 0.0.0.0/0 or from your home IP
+```
+
+From the **laptop** (not from the VPS):
+
+```bash
+nc -vz 172.197.216.135 9993
+# or:
+timeout 5 bash -c 'echo >/dev/tcp/172.197.216.135/9993' && echo open || echo blocked
+```
+
+**Pass:** `succeeded` / `open` in about a second. Then `mynet join --coordinator 172.197.216.135:9993` will work.  
+**Fail:** still `timed out` — do not keep retrying join. Open the cloud firewall, or test Alice↔Bob with manual import on the VM LAN (Test 3) until 9993 works.
+
+`VPS_PUBLIC_IP` in the join command is a placeholder. Use the real IPv4 (`172.197.216.135`), never the string `VPS_PUBLIC_IP`.
+
+---
+
 ## 0. VPS — coordinator
 
 On the VPS, from the repository root:
@@ -297,7 +372,13 @@ sudo --preserve-env=MYNET_CONFIG_DIR mynet connect --ip 10.42.0.1
 sudo --preserve-env=MYNET_CONFIG_DIR mynet connect --ip 10.42.0.2
 ```
 
-If `MYNET_CONFIG_DIR` is unset, `sudo mynet connect` is enough.
+`sudo` changes `HOME` to `/root`. After this repo's `SUDO_USER` lookup, `sudo mynet connect` uses the invoking user's `~/.config/mynet`. Until that binary is installed, pass the path explicitly:
+
+```bash
+sudo MYNET_CONFIG_DIR="$HOME/.config/mynet" mynet connect --ip 10.42.0.1
+```
+
+Do not run `mynet init` as root to "fix" a missing identity — that creates a second key under `/root`.
 
 In a **second** terminal on each:
 
@@ -419,7 +500,7 @@ Two NATs, no UDP 51820 port-forward: direct WG often never handshakes. This is t
 **VPS**
 
 ```bash
-docker compose --profile relay up -d --build
+docker compose up -d --build
 docker compose ps
 ss -lnu | grep 9994
 ```
@@ -547,7 +628,6 @@ sudo ip link del mynet0 2>/dev/null || true
 **VPS**
 
 ```bash
-docker compose --profile relay down
 docker compose down
 # membership state is in the docker volume coordinator-state
 # docker volume rm mynet_coordinator-state    # only if you want a blank coordinator
@@ -589,7 +669,7 @@ cd mynet
 cp .env.example .env          # edit token + ports
 docker compose up -d --build
 docker compose logs -f coordinator
-docker compose --profile relay up -d --build
+docker compose up -d --build
 docker compose ps
 docker compose stop coordinator
 docker compose start coordinator

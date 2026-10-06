@@ -2,24 +2,26 @@
 
 This is the operator guide. It answers **what runs where**, **where the VPS IP and port go**, and **how to start the coordinator in Docker**.
 
-mynet is a peer-to-peer VPN. Encrypted overlay traffic (WireGuard UDP) goes **laptop to laptop**. The VPS is an optional **coordination server** for registration and endpoint discovery. It is **not** a VPN gateway and must not carry overlay packets.
+mynet is a peer-to-peer VPN. Encrypted overlay traffic is WireGuard UDP, preferably **laptop to laptop**. The VPS is a **discovery server** plus an optional **pair UDP relay** for when both laptops sit behind NAT. `rnet start` / `rnet connect SECRET` use that VPS; the secret is the membership.
 
 ```text
-  laptop A  ---------------- WireGuard UDP :51820 ----------------  laptop B
-       \                                                         /
-        \              TCP :9993 (control plane only)           /
-         \                                                     /
-                    VPS  Docker  mynet-coordinator
+  laptop A  -------- WireGuard UDP :51820 (direct if NAT allows) --------  laptop B
+       \                               |                                 /
+        \                              | UDP :9994 relay (two peers)    /
+         \                             v                               /
+          \---- TCP :9993 discovery ---- VPS (coordinator + relay) ----/
 ```
 
 | Role | Machine | Process | Listens | Carries VPN payload? |
 | --- | --- | --- | --- | --- |
-| Coordinator | VPS | `mynet-coordinator` (Docker) | TCP `MYNET_COORD_PORT` (default **9993**) | **No** |
-| Pair relay (optional) | VPS | `mynet-relay` (`--profile relay`) | UDP `MYNET_RELAY_PORT` (default **9994**) | Opaque WG datagrams only (two peers) |
-| Node | Each laptop/PC | `mynet` | UDP **51820** (WireGuard) | **Yes**, to other nodes or via the pair relay |
+| Coordinator | VPS | `mynet-coordinator` (Docker) | TCP **9993** | **No** |
+| Pair relay | VPS | `mynet-relay` (Docker, default) | UDP **9994** | Opaque WG datagrams only (two peers) |
+| Node | Each laptop/PC | `rnet` | UDP **51820** (WireGuard) | **Yes**, to the other node or via the pair relay |
 | Identity | Each laptop | `identity.toml` | — | Private key never leaves the machine |
 
-Default overlay: `10.42.0.0/24`. Pick a unique address per machine (`.1`, `.2`, `.3`, …). Do not use `.0` or `.255`.
+On each laptop that will run `rnet start`, put the VPS public IP in `~/.config/mynet/discovery.toml`. The person who only runs `rnet connect SECRET` does not need that file; the secret includes the discovery address.
+
+Default overlay: `10.42.0.0/24`. `rnet start` takes `.1` in a new session room; `rnet connect` is allocated `.2`.
 
 ---
 
@@ -155,6 +157,8 @@ Then:
 mynet status            # shows coordinator host, not the token
 mynet peer list         # other members the coordinator advertised
 sudo mynet connect      # kernel WireGuard; needs CAP_NET_ADMIN
+# uses SUDO_USER's ~/.config/mynet (not /root). Until rebuilt:
+# sudo MYNET_CONFIG_DIR="$HOME/.config/mynet" mynet connect
 ```
 
 `mynet connect` re-registers with the coordinator if `local.toml` has a coordinator, then brings up `mynet0`. While connected it refreshes endpoints about every 30 seconds. If the VPS dies, existing WireGuard sessions keep using the last known endpoints.
@@ -228,7 +232,7 @@ If direct WireGuard UDP cannot complete a handshake (typical behind two NATs), r
 
 ```bash
 # on the VPS, from the repository root
-docker compose --profile relay up -d --build
+docker compose up -d --build
 ```
 
 Firewall: allow **inbound UDP** on `MYNET_RELAY_PORT` (default **9994**). Put that port in `.env` as `MYNET_RELAY_PORT`. Laptops use the VPS public IP:

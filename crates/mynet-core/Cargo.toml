@@ -8,6 +8,7 @@ publish.workspace = true
 description = "Shared constants, paths, and trusted-peer config for mynet"
 
 [dependencies]
+base64 = { workspace = true }
 dirs = { workspace = true }
 mynet-identity = { path = "../mynet-identity" }
 serde = { workspace = true }

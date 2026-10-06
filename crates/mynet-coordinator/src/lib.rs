@@ -45,6 +45,8 @@ impl CoordinatorConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StoredMember {
+    #[serde(default)]
+    token: String,
     public_key: String,
     virtual_ip: String,
     endpoint: String,
@@ -67,14 +69,15 @@ struct Member {
 
 pub struct Registry {
     config: CoordinatorConfig,
-    members: HashMap<String, Member>,
+    /// Isolated overlay rooms keyed by join/session token.
+    rooms: HashMap<String, HashMap<String, Member>>,
 }
 
 impl Registry {
     pub fn new(config: CoordinatorConfig) -> Self {
         let mut reg = Registry {
             config,
-            members: HashMap::new(),
+            rooms: HashMap::new(),
         };
         if let Some(path) = reg.config.state_path.clone() {
             if let Err(e) = reg.load_from(&path) {
@@ -82,6 +85,14 @@ impl Registry {
             }
         }
         reg
+    }
+
+    fn room(&self, token: &str) -> Option<&HashMap<String, Member>> {
+        self.rooms.get(token)
+    }
+
+    fn room_mut(&mut self, token: &str) -> &mut HashMap<String, Member> {
+        self.rooms.entry(token.to_string()).or_default()
     }
 
     fn load_from(&mut self, path: &Path) -> Result<(), CoordError> {
@@ -95,7 +106,8 @@ impl Registry {
                 let parsed: StateFile = toml::from_str(&text).map_err(|_| CoordError::Malformed)?;
                 for rec in parsed.members {
                     if let Ok(member) = member_from_stored(&rec) {
-                        self.members.insert(member.public_key.clone(), member);
+                        let pk = member.public_key.clone();
+                        self.room_mut(&rec.token).insert(pk, member);
                     }
                 }
                 Ok(())
@@ -115,18 +127,19 @@ impl Registry {
                 })?;
             }
         }
-        let file = StateFile {
-            members: self
-                .members
-                .values()
-                .map(|m| StoredMember {
+        let mut members = Vec::new();
+        for (token, room) in &self.rooms {
+            for m in room.values() {
+                members.push(StoredMember {
+                    token: token.clone(),
                     public_key: m.public_key.clone(),
                     virtual_ip: m.virtual_ip.to_string(),
                     endpoint: m.endpoint.to_string(),
                     last_seen_unix: m.last_seen_unix,
-                })
-                .collect(),
-        };
+                });
+            }
+        }
+        let file = StateFile { members };
         let serialized = toml::to_string_pretty(&file).map_err(|_| CoordError::Malformed)?;
         let mut opts = OpenOptions::new();
         opts.write(true).create(true).truncate(true);
@@ -151,11 +164,11 @@ impl Registry {
         }
         match req.kind.as_str() {
             KIND_REGISTER => match self.register(req, peer_addr) {
-                Ok(()) => ControlResponse::ok(self.advertise()),
+                Ok(()) => ControlResponse::ok(self.advertise(&req.token)),
                 Err(e) => ControlResponse::error(e.to_string()),
             },
-            KIND_DISCOVER => ControlResponse::ok(self.advertise()),
-            KIND_ALLOCATE => match self.next_free_ip() {
+            KIND_DISCOVER => ControlResponse::ok(self.advertise(&req.token)),
+            KIND_ALLOCATE => match self.next_free_ip(&req.token) {
                 Some(ip) => ControlResponse::allocated(ip.to_string()),
                 None => ControlResponse::error("overlay address pool exhausted"),
             },
@@ -168,10 +181,12 @@ impl Registry {
             return Ok(());
         }
         if presented == self.config.join_token {
-            Ok(())
-        } else {
-            Err("invalid join token".to_string())
+            return Ok(());
         }
+        if is_session_token(presented) {
+            return Ok(());
+        }
+        Err("invalid join token".to_string())
     }
 
     fn register(&mut self, req: &ControlRequest, peer_addr: SocketAddr) -> Result<(), CoordError> {
@@ -191,61 +206,73 @@ impl Registry {
             None => ipv4_endpoint(peer_addr, req.listen_port)?,
         };
         let now = unix_now();
+        let room_key = req.token.clone();
 
-        if let Some(existing) = self.members.values().find(|m| m.virtual_ip == virtual_ip && m.public_key != pk)
         {
-            return Err(CoordError::IpTaken(existing.virtual_ip));
-        }
-        if let Some(existing) = self.members.get(&pk) {
-            if existing.virtual_ip != virtual_ip {
-                return Err(CoordError::KeyIpMismatch {
-                    trusted: existing.virtual_ip,
-                    advertised: virtual_ip,
-                });
+            let room = self.room_mut(&room_key);
+            if let Some(existing) = room.values().find(|m| m.virtual_ip == virtual_ip && m.public_key != pk)
+            {
+                return Err(CoordError::IpTaken(existing.virtual_ip));
             }
+            if let Some(existing) = room.get(&pk) {
+                if existing.virtual_ip != virtual_ip {
+                    return Err(CoordError::KeyIpMismatch {
+                        trusted: existing.virtual_ip,
+                        advertised: virtual_ip,
+                    });
+                }
+            }
+            room.insert(
+                pk.clone(),
+                Member {
+                    public_key: pk,
+                    virtual_ip,
+                    endpoint,
+                    last_seen_unix: now,
+                },
+            );
         }
-
-        self.members.insert(
-            pk.clone(),
-            Member {
-                public_key: pk,
-                virtual_ip,
-                endpoint,
-                last_seen_unix: now,
-            },
-        );
         self.persist()?;
         Ok(())
     }
 
-    pub fn next_free_ip(&self) -> Option<Ipv4Addr> {
+    pub fn next_free_ip(&self, token: &str) -> Option<Ipv4Addr> {
+        let room = self.room(token);
         for host in 1u8..=254 {
             let ip = Ipv4Addr::new(10, 42, 0, host);
-            if !self.members.values().any(|m| m.virtual_ip == ip) {
+            let taken = room.map(|r| r.values().any(|m| m.virtual_ip == ip)).unwrap_or(false);
+            if !taken {
                 return Some(ip);
             }
         }
         None
     }
 
-    fn advertise(&self) -> Vec<AdvertisedPeer> {
+    fn advertise(&self, token: &str) -> Vec<AdvertisedPeer> {
         let mut peers: Vec<AdvertisedPeer> = self
-            .members
-            .values()
-            .map(|m| AdvertisedPeer {
-                public_key: m.public_key.clone(),
-                virtual_ip: m.virtual_ip.to_string(),
-                endpoint: Some(m.endpoint.to_string()),
-                last_seen_unix: m.last_seen_unix,
+            .room(token)
+            .map(|r| {
+                r.values()
+                    .map(|m| AdvertisedPeer {
+                        public_key: m.public_key.clone(),
+                        virtual_ip: m.virtual_ip.to_string(),
+                        endpoint: Some(m.endpoint.to_string()),
+                        last_seen_unix: m.last_seen_unix,
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
         peers.sort_by(|a, b| a.public_key.cmp(&b.public_key));
         peers
     }
 
     pub fn len(&self) -> usize {
-        self.members.len()
+        self.rooms.values().map(|r| r.len()).sum()
     }
+}
+
+fn is_session_token(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn member_from_stored(rec: &StoredMember) -> Result<Member, CoordError> {
@@ -362,14 +389,21 @@ fn handle_client(mut stream: TcpStream, state: &Mutex<Registry>) -> Result<(), m
     Ok(())
 }
 
+/// Serve `listener` in a background thread. The socket must already be bound.
+pub fn spawn(listener: TcpListener, config: CoordinatorConfig) -> io::Result<SocketAddr> {
+    let addr = listener.local_addr()?;
+    thread::spawn(move || {
+        if let Err(e) = serve(listener, config) {
+            tracing::error!(error = %e, "coordinator stopped");
+        }
+    });
+    Ok(addr)
+}
+
 /// Bind `127.0.0.1:0` and serve in a background thread. Used by tests.
 pub fn spawn_for_test(config: CoordinatorConfig) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
-    let addr = listener.local_addr()?;
-    thread::spawn(move || {
-        let _ = serve(listener, config);
-    });
-    Ok(addr)
+    spawn(listener, config)
 }
 
 #[cfg(test)]
@@ -610,6 +644,41 @@ mod tests {
         drop(reg);
         let loaded = Registry::new(cfg);
         assert_eq!(loaded.len(), 1);
+    }
+
+    #[test]
+    fn session_rooms_are_isolated() {
+        let mut reg = Registry::new(CoordinatorConfig {
+            join_token: "master".into(),
+            network: "lab".into(),
+            state_path: None,
+        });
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let room_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let room_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let a = ControlRequest::register(
+            room_a,
+            alice.public_key().to_base64(),
+            "10.42.0.1",
+            51820,
+            Some("192.0.2.10:51820".into()),
+        );
+        let b = ControlRequest::register(
+            room_b,
+            bob.public_key().to_base64(),
+            "10.42.0.1",
+            51820,
+            Some("198.51.100.20:51820".into()),
+        );
+        let ra = reg.handle(&a, "127.0.0.1:9".parse().unwrap());
+        let rb = reg.handle(&b, "127.0.0.1:9".parse().unwrap());
+        assert!(ra.is_ok(), "{ra:?}");
+        assert!(rb.is_ok(), "{rb:?}");
+        assert_eq!(ra.peers.len(), 1);
+        assert_eq!(rb.peers.len(), 1);
+        assert_eq!(ra.peers[0].public_key, alice.public_key().to_base64());
+        assert_eq!(rb.peers[0].public_key, bob.public_key().to_base64());
     }
 
     #[test]

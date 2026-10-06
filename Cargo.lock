@@ -352,6 +352,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "getrandom",
  "libc",
  "mynet-core",
  "mynet-identity",
@@ -386,6 +387,7 @@ name = "mynet-core"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
+ "base64",
  "bitflags",
  "cfg-if",
  "clap_builder",

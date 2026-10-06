@@ -1,12 +1,12 @@
-//! mynet CLI: control plane plus Linux data-plane helpers.
+//! rnet/mynet CLI: `rnet start` plus `rnet connect <secret>`, and lab helpers.
 //!
 //! `tun-test` and `connect --plain` are learning paths. Encrypted traffic
-//! uses kernel WireGuard (`mynet connect` without `--plain`).
+//! uses kernel WireGuard.
 
 mod coord;
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,16 +17,18 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use mynet_core::{
     config_dir, identity_path_in, local_path_in, parse_endpoint, peers_path_in, session_path_in,
-    LocalConfig, LocalError, Peer, PeerList, PeerState, SessionEvent, SessionTable, APP_NAME,
-    CONFIG_DIR_ENV, COORDINATOR_SYNC_SECS, DEFAULT_COORDINATOR_PORT, DEFAULT_INTERFACE,
-    DEFAULT_LISTEN_PORT, HANDSHAKE_TIMEOUT_SECS, VERSION,
+    split_host_port, Invite, LocalConfig, LocalError, Peer, PeerList, PeerState, SessionEvent,
+    SessionTable, APP_NAME, CONFIG_DIR_ENV, COORDINATOR_SYNC_SECS, DEFAULT_COORDINATOR_PORT,
+    DEFAULT_INTERFACE, DEFAULT_LISTEN_PORT, DEFAULT_RELAY_PORT, HANDSHAKE_TIMEOUT_SECS,
+    INVITE_SYNC_SECS, VERSION,
 };
-use mynet_identity::{Identity, PublicKey};
+use mynet_identity::{Identity, IdentityError, PublicKey};
 use mynet_transport::run_plain_loop;
 use mynet_vpn::{
     apply_wireguard, parse_ipv4, primary_ipv4, teardown_wireguard, upsert_wg_peer,
     wg_latest_handshakes, TunDevice, TunError, WgPeer,
 };
+use serde::Deserialize;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -43,13 +45,13 @@ fn install_stop_handler() {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = APP_NAME,
+    name = "rnet",
     version,
-    about = "A small Linux P2P VPN built from first principles",
-    long_about = "mynet is a learning-focused peer-to-peer VPN for Linux.\n\n\
-Peers authenticate with public keys, get virtual IPv4 addresses, and send \
-encrypted traffic directly over UDP when possible. A coordination server, \
-if used later, is for discovery only and is never the VPN data path."
+    about = "rnet start, then rnet connect <secret>",
+    long_about = "rnet (mynet) is a learning-focused peer-to-peer VPN for Linux.\n\n\
+Typical use: `rnet start` on one machine, then `rnet connect <secret>` on the other.\n\
+Peers authenticate with public keys. Overlay traffic is kernel WireGuard.\n\
+The coordinator inside `start` is control plane only and is never the VPN data path."
 )]
 struct Cli {
     /// Config directory (identity, peers). Overrides MYNET_CONFIG_DIR.
@@ -87,19 +89,26 @@ enum CliCommand {
         #[arg(long, default_value_t = 0)]
         duration: u64,
     },
-    /// Bring up the overlay (kernel WireGuard, or --plain UDP)
-    Connect {
-        #[arg(long)]
-        ip: Option<Ipv4Addr>,
-        #[arg(long, default_value_t = DEFAULT_LISTEN_PORT)]
+    /// Print a secret and keep the VPN up until Ctrl-C
+    Start {
+        #[arg(long, hide = true, default_value_t = DEFAULT_LISTEN_PORT)]
         listen_port: u16,
-        #[arg(long, default_value = DEFAULT_INTERFACE)]
+        #[arg(long, hide = true, default_value = DEFAULT_INTERFACE)]
         interface: String,
-        /// INSECURE: TUN + plaintext UDP instead of WireGuard
-        #[arg(long)]
+    },
+    /// Join with the secret from `rnet start`
+    Connect {
+        /// Secret printed by `rnet start`
+        secret: Option<String>,
+        #[arg(long, hide = true)]
+        ip: Option<Ipv4Addr>,
+        #[arg(long, hide = true, default_value_t = DEFAULT_LISTEN_PORT)]
+        listen_port: u16,
+        #[arg(long, hide = true, default_value = DEFAULT_INTERFACE)]
+        interface: String,
+        #[arg(long, hide = true)]
         plain: bool,
-        /// Optional two-peer UDP relay (fallback if direct handshake times out)
-        #[arg(long)]
+        #[arg(long, hide = true)]
         relay: Option<String>,
     },
     /// Tear down the overlay interface
@@ -191,6 +200,226 @@ fn resolve_config_dir(explicit: Option<PathBuf>) -> PathBuf {
 fn print_identity(identity: &Identity) {
     println!("Peer ID: {}", identity.peer_id());
     println!("Public Key: {}", identity.public_key());
+}
+
+fn invoked_as() -> String {
+    std::env::args_os()
+        .next()
+        .as_ref()
+        .and_then(|p| Path::new(p).file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("rnet")
+        .to_string()
+}
+
+fn euid_is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+fn require_net_admin(action: &str) -> Result<()> {
+    if euid_is_root() {
+        return Ok(());
+    }
+    let bin = invoked_as();
+    bail!(
+        "{action} needs root to create the WireGuard interface.\n  sudo {bin} {action}\n\
+         (sudo keeps your user config; do not run `{bin} init` as root)"
+    );
+}
+
+fn random_token() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("random token: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn ensure_identity(dir: &Path) -> Result<Identity> {
+    let path = identity_path_in(dir);
+    match Identity::load_from(&path) {
+        Ok(id) => Ok(id),
+        Err(IdentityError::NotFound { .. }) => {
+            let identity = Identity::generate();
+            identity.save_to(&path, false)?;
+            tracing::info!(peer_id = %identity.peer_id(), path = %path.display(), "identity stored");
+            println!("Identity created at {}", path.display());
+            print_identity(&identity);
+            Ok(identity)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscoveryFile {
+    coordinator: String,
+    #[serde(default)]
+    relay: Option<String>,
+}
+
+fn relay_for_coordinator(coordinator: &str) -> Result<String> {
+    let (host, _) = split_host_port(coordinator)?;
+    Ok(format!("{host}:{DEFAULT_RELAY_PORT}"))
+}
+
+fn load_discovery(dir: &Path) -> Result<(String, String)> {
+    if let Ok(v) = std::env::var("RNET_DISCOVERY").or_else(|_| std::env::var("MYNET_DISCOVERY")) {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            split_host_port(&v)?;
+            let relay = relay_for_coordinator(&v)?;
+            return Ok((v, relay));
+        }
+    }
+    let path = dir.join("discovery.toml");
+    if path.exists() {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("read {}", path.display()))?;
+        let parsed: DiscoveryFile = toml::from_str(&text).context("discovery.toml is malformed")?;
+        split_host_port(&parsed.coordinator)?;
+        let relay = match parsed.relay {
+            Some(r) => {
+                split_host_port(&r)?;
+                r
+            }
+            None => relay_for_coordinator(&parsed.coordinator)?,
+        };
+        return Ok((parsed.coordinator, relay));
+    }
+    if let Ok(local) = LocalConfig::load_from(&local_path_in(dir)) {
+        if let Some(c) = local.coordinator {
+            let relay = local
+                .relay
+                .unwrap_or_else(|| relay_for_coordinator(&c).unwrap_or_else(|_| c.clone()));
+            return Ok((c, relay));
+        }
+    }
+    let bin = invoked_as();
+    bail!(
+        "{bin} start needs a public discovery server (your VPS/VM on the internet).\n\
+         Create {} with:\n\n\
+         coordinator = \"VPS_PUBLIC_IP:{DEFAULT_COORDINATOR_PORT}\"\n\
+         relay = \"VPS_PUBLIC_IP:{DEFAULT_RELAY_PORT}\"\n\n\
+         On the VPS: docker compose up -d\n\
+         Or set RNET_DISCOVERY=VPS_PUBLIC_IP:{DEFAULT_COORDINATOR_PORT}",
+        path.display()
+    );
+}
+
+fn tcp_reachable(coordinator: &str, timeout: Duration) -> bool {
+    let Ok((host, port)) = split_host_port(coordinator) else {
+        return false;
+    };
+    let Ok(mut addrs) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    let Some(addr) = addrs.find(|a| a.is_ipv4()) else {
+        return false;
+    };
+    std::net::TcpStream::connect_timeout(&addr, timeout).is_ok()
+}
+
+fn pick_coordinator(candidates: &[String]) -> Result<String> {
+    let timeout = Duration::from_secs(5);
+    for c in candidates {
+        tracing::info!(coordinator = %c, "trying discovery server");
+        if tcp_reachable(c, timeout) {
+            return Ok(c.clone());
+        }
+    }
+    bail!(
+        "could not reach the discovery server (tried {}). Is the VPS up and is TCP 9993 open?",
+        candidates.join(", ")
+    )
+}
+
+fn cmd_start(dir: &Path, listen_port: u16, interface: String) -> Result<()> {
+    require_net_admin("start")?;
+    let (coordinator, relay) = load_discovery(dir)?;
+    let identity = ensure_identity(dir)?;
+    let token = random_token()?;
+    tracing::info!(coordinator = %coordinator, "registering with public discovery server");
+    let ip = coord::allocate_ip(&coordinator, &token, &identity.public_key().to_base64())?;
+    tracing::info!(overlay = %ip, "assigned overlay IP");
+    let report = coord::join(
+        dir,
+        coordinator.clone(),
+        token.clone(),
+        ip,
+        listen_port,
+        interface.clone(),
+        None,
+        Some("rnet".into()),
+    )?;
+    coord::print_report(&report);
+
+    let invite = Invite::new(
+        vec![coordinator],
+        token,
+        listen_port,
+        Some(relay.clone()),
+    )?;
+    let secret = invite.encode();
+    let bin = invoked_as();
+    let banner = format!(
+        "\nsecret    {secret}\noverlay   {ip}\niface     {interface}\n\nOn the other computer (anywhere on the internet):\n  {bin} connect {secret}\n\nCtrl-C stops the network.\n"
+    );
+
+    cmd_connect(
+        dir,
+        Some(ip),
+        listen_port,
+        interface,
+        false,
+        Some(relay),
+        INVITE_SYNC_SECS,
+        Some(banner),
+    )
+}
+
+fn cmd_connect_invite(
+    dir: &Path,
+    secret: String,
+    listen_port: u16,
+    interface: String,
+) -> Result<()> {
+    let _ = listen_port;
+    let invite = Invite::decode(&secret)?;
+    require_net_admin("connect")?;
+    let identity = ensure_identity(dir)?;
+    let coordinator = pick_coordinator(&invite.coordinators)?;
+    tracing::info!(coordinator = %coordinator, "reached discovery server");
+    let ip = coord::allocate_ip(
+        &coordinator,
+        &invite.token,
+        &identity.public_key().to_base64(),
+    )?;
+    tracing::info!(overlay = %ip, "assigned overlay IP");
+    println!("overlay   {ip}");
+    let report = coord::join(
+        dir,
+        coordinator.clone(),
+        invite.token.clone(),
+        ip,
+        invite.listen_port,
+        interface.clone(),
+        None,
+        Some("rnet".into()),
+    )?;
+    coord::print_report(&report);
+    let relay = invite
+        .relay
+        .clone()
+        .or_else(|| relay_for_coordinator(&coordinator).ok());
+    cmd_connect(
+        dir,
+        Some(ip),
+        invite.listen_port,
+        interface,
+        false,
+        relay,
+        INVITE_SYNC_SECS,
+        None,
+    )
 }
 
 fn cmd_init(dir: &Path, force: bool) -> Result<()> {
@@ -425,6 +654,8 @@ fn cmd_connect(
     interface: String,
     plain: bool,
     relay: Option<String>,
+    sync_secs: u64,
+    after_up: Option<String>,
 ) -> Result<()> {
     let identity = Identity::load_from(&identity_path_in(dir))?;
     let ip = match ip {
@@ -433,7 +664,7 @@ fn cmd_connect(
     };
     let mut cfg = persist_overlay(dir, ip, listen_port, interface.clone())?;
     if let Some(relay) = relay {
-        mynet_core::split_host_port(&relay)?;
+        split_host_port(&relay)?;
         cfg.relay = Some(relay);
         cfg.save_to(&local_path_in(dir))?;
     }
@@ -456,10 +687,10 @@ fn cmd_connect(
 
     if plain {
         println!("WARNING: --plain forwards overlay IPv4 as unencrypted UDP.");
-        println!("This is a learning path. It is NOT the VPN. Use `mynet connect` for WireGuard.");
+        println!("This is a learning path. It is NOT the VPN. Use `rnet connect` for WireGuard.");
         cmd_connect_plain(&cfg, &list)?;
     } else {
-        cmd_connect_wireguard(dir, &identity, &cfg, &list)?;
+        cmd_connect_wireguard(dir, &identity, &cfg, &list, sync_secs, after_up)?;
     }
     Ok(())
 }
@@ -489,6 +720,8 @@ fn cmd_connect_wireguard(
     identity: &Identity,
     cfg: &LocalConfig,
     list: &PeerList,
+    sync_secs: u64,
+    after_up: Option<String>,
 ) -> Result<()> {
     let relay_addr = match &cfg.relay {
         Some(s) => Some(resolve_host_port(s)?),
@@ -518,6 +751,9 @@ fn cmd_connect_wireguard(
         "WireGuard {} {}  UDP :{}",
         cfg.interface, cfg.virtual_ip, cfg.listen_port
     );
+    if let Some(msg) = after_up {
+        println!("{msg}");
+    }
     if let Some(c) = &cfg.coordinator {
         println!("coordinator {c} (control plane only; overlay UDP does not go there)");
     }
@@ -543,7 +779,10 @@ fn cmd_connect_wireguard(
     }
     let _ = sessions.save_to(&session_path);
 
-    println!("Press Ctrl-C to disconnect (or run `mynet disconnect`).");
+    println!(
+        "Press Ctrl-C to disconnect (or run `{} disconnect`).",
+        invoked_as()
+    );
     install_stop_handler();
     let mut last_sync = Instant::now();
     let connecting_since = Instant::now();
@@ -553,7 +792,11 @@ fn cmd_connect_wireguard(
         if let Ok(handshakes) = wg_latest_handshakes(&cfg.interface) {
             for (pk, ts) in handshakes {
                 if ts > 0 {
+                    let before = sessions.get(&pk).map(|r| r.state);
                     let _ = sessions.apply(&pk, SessionEvent::HandshakeOk, None);
+                    if before == Some(PeerState::Connecting) {
+                        tracing::info!(peer = %pk, "peer handshake ok");
+                    }
                 }
             }
         }
@@ -602,7 +845,7 @@ fn cmd_connect_wireguard(
             changed
         };
         if cfg.coordinator.is_some()
-            && (src_changed || last_sync.elapsed() >= Duration::from_secs(COORDINATOR_SYNC_SECS))
+            && (src_changed || last_sync.elapsed() >= Duration::from_secs(sync_secs.max(1)))
         {
             last_sync = Instant::now();
             match coord::register_and_apply(dir, identity, cfg, true, None) {
@@ -716,13 +959,36 @@ fn main() -> Result<()> {
             ip,
             duration,
         } => cmd_tun_test(interface, ip, duration)?,
+        CliCommand::Start {
+            listen_port,
+            interface,
+        } => cmd_start(&dir, listen_port, interface)?,
         CliCommand::Connect {
+            secret,
             ip,
             listen_port,
             interface,
             plain,
             relay,
-        } => cmd_connect(&dir, ip, listen_port, interface, plain, relay)?,
+        } => {
+            if let Some(secret) = secret {
+                if ip.is_some() || plain || relay.is_some() {
+                    bail!("`connect <secret>` does not take extra flags");
+                }
+                cmd_connect_invite(&dir, secret, listen_port, interface)?;
+            } else {
+                cmd_connect(
+                    &dir,
+                    ip,
+                    listen_port,
+                    interface,
+                    plain,
+                    relay,
+                    COORDINATOR_SYNC_SECS,
+                    None,
+                )?;
+            }
+        }
         CliCommand::Disconnect { interface } => cmd_disconnect(&dir, interface)?,
         CliCommand::Export { ip, endpoint } => cmd_export(&dir, ip, endpoint)?,
         CliCommand::Join {
@@ -829,7 +1095,7 @@ mod tests {
         let help = cmd.render_long_help().to_string();
         for needle in [
             "version", "init", "identity", "peer", "tun-test", "connect", "disconnect", "export",
-            "join", "sync", "status",
+            "join", "sync", "status", "start",
         ] {
             assert!(help.contains(needle), "help missing {needle}");
         }

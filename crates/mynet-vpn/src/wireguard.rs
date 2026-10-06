@@ -28,7 +28,9 @@ pub struct WgPeer {
 pub enum WgError {
     #[error("{0}")]
     Tun(#[from] TunError),
-    #[error("`wg` command not found")]
+    #[error(
+        "`wg` command not found; install wireguard-tools (e.g. `sudo apt-get install -y wireguard wireguard-tools`)"
+    )]
     WgMissing,
     #[error("wg {args:?} failed: {stderr}")]
     WgFailed { args: Vec<String>, stderr: String },
@@ -211,8 +213,16 @@ pub fn parse_latest_handshakes(text: &str) -> Vec<(String, u64)> {
 
 /// Best-effort primary IPv4 from `ip route get 1.1.1.1` (`src` field).
 pub fn primary_ipv4() -> Option<Ipv4Addr> {
+    source_ipv4_toward(Ipv4Addr::new(1, 1, 1, 1))
+}
+
+/// Source IPv4 the kernel would use to reach `dest` (`ip route get`).
+pub fn source_ipv4_toward(dest: Ipv4Addr) -> Option<Ipv4Addr> {
     let bin = find_ip().ok()?;
-    let out = Command::new(bin).args(["-4", "route", "get", "1.1.1.1"]).output().ok()?;
+    let out = Command::new(bin)
+        .args(["-4", "route", "get", &dest.to_string()])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -227,6 +237,118 @@ pub fn parse_src_ipv4(text: &str) -> Option<Ipv4Addr> {
         }
     }
     None
+}
+
+fn is_overlay_ipv4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 10 && o[1] == 42 && o[2] == 0
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IfAddr {
+    pub iface: String,
+    pub ip: Ipv4Addr,
+}
+
+/// Parse `ip -4 -o addr show` into interface addresses.
+pub fn parse_if_addrs(text: &str) -> Vec<IfAddr> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut toks = line.split_whitespace();
+        let Some(_idx) = toks.next() else { continue };
+        let Some(iface) = toks.next() else { continue };
+        while let Some(t) = toks.next() {
+            if t != "inet" {
+                continue;
+            }
+            if let Some(cidr) = toks.next() {
+                let addr = cidr.split('/').next().unwrap_or(cidr);
+                if let Ok(ip) = addr.parse::<Ipv4Addr>() {
+                    out.push(IfAddr {
+                        iface: iface.trim_end_matches(':').to_string(),
+                        ip,
+                    });
+                }
+            }
+            break;
+        }
+    }
+    out
+}
+
+pub fn parse_local_ipv4s(text: &str) -> Vec<Ipv4Addr> {
+    parse_if_addrs(text).into_iter().map(|a| a.ip).collect()
+}
+
+fn lan_score(iface: &str, ip: Ipv4Addr, default_src: Option<Ipv4Addr>) -> i32 {
+    if ip.is_loopback() || is_overlay_ipv4(ip) || !ip.is_private() {
+        return i32::MIN / 2;
+    }
+    let name = iface.to_ascii_lowercase();
+    let o = ip.octets();
+    let mut s = 10;
+    if name.starts_with("vboxnet") || name.starts_with("vmnet") || name.contains("hostonly") {
+        s += 100;
+    }
+    // VirtualBox default host-only (192.168.56.0/24)
+    if o[0] == 192 && o[1] == 168 && o[2] == 56 {
+        s += 80;
+    }
+    if name.starts_with("virbr") {
+        s += 40;
+    }
+    if Some(ip) == default_src {
+        s -= 25;
+    }
+    if name.starts_with("docker") || name.starts_with("br-") || name == "lxcbr0" || name == "cni0" {
+        s -= 60;
+    }
+    if name.starts_with("tun") || name.starts_with("wg") || name.starts_with("mynet") {
+        s -= 100;
+    }
+    s
+}
+
+/// Private LAN IPv4s, best first (host-only / VM NICs before Wi-Fi).
+pub fn rank_lan_ipv4s(addrs: &[IfAddr], default_src: Option<Ipv4Addr>) -> Vec<Ipv4Addr> {
+    let mut scored: Vec<(i32, Ipv4Addr)> = addrs
+        .iter()
+        .map(|a| (lan_score(&a.iface, a.ip, default_src), a.ip))
+        .filter(|(s, _)| *s > i32::MIN / 4)
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out = Vec::new();
+    for (_, ip) in scored {
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
+/// Address to put first in an invite (VirtualBox host-only when present).
+pub fn pick_advertise_ipv4() -> Option<Ipv4Addr> {
+    pick_lan_ipv4s().into_iter().next()
+}
+
+/// All ranked LAN IPv4s for the invite (joiner tries them until one answers).
+pub fn pick_lan_ipv4s() -> Vec<Ipv4Addr> {
+    let addrs = local_if_addrs();
+    let wan = primary_ipv4();
+    rank_lan_ipv4s(&addrs, wan)
+}
+
+fn local_if_addrs() -> Vec<IfAddr> {
+    let Ok(bin) = find_ip() else {
+        return Vec::new();
+    };
+    let Ok(out) = Command::new(bin).args(["-4", "-o", "addr", "show"]).output() else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    parse_if_addrs(&String::from_utf8_lossy(&out.stdout))
 }
 
 fn write_private_key(key: &[u8; 32]) -> Result<PathBuf, WgError> {
@@ -337,5 +459,33 @@ mod tests {
             parse_src_ipv4(sample).unwrap(),
             Ipv4Addr::new(192, 168, 1, 50)
         );
+    }
+
+    #[test]
+    fn parse_ip_dash_o_addr() {
+        let text = "\
+2: wlp62s0    inet 192.168.1.50/24 brd 192.168.1.255 scope global wlp62s0
+18: vboxnet0    inet 192.168.56.1/24 brd 192.168.56.255 scope global vboxnet0
+1: lo    inet 127.0.0.1/8 scope host lo
+";
+        let ips = parse_local_ipv4s(text);
+        assert!(ips.contains(&Ipv4Addr::new(192, 168, 1, 50)));
+        assert!(ips.contains(&Ipv4Addr::new(192, 168, 56, 1)));
+        assert!(ips.contains(&Ipv4Addr::new(127, 0, 0, 1)));
+    }
+
+    #[test]
+    fn host_only_ranks_ahead_of_wifi() {
+        let addrs = parse_if_addrs(
+            "\
+2: wlp62s0    inet 192.168.1.50/24 brd 192.168.1.255 scope global wlp62s0
+18: vboxnet0    inet 192.168.56.1/24 brd 192.168.56.255 scope global vboxnet0
+1: lo    inet 127.0.0.1/8 scope host lo
+",
+        );
+        let ranked = rank_lan_ipv4s(&addrs, Some(Ipv4Addr::new(192, 168, 1, 50)));
+        assert_eq!(ranked[0], Ipv4Addr::new(192, 168, 56, 1));
+        assert!(ranked.contains(&Ipv4Addr::new(192, 168, 1, 50)));
+        assert!(!ranked.contains(&Ipv4Addr::new(127, 0, 0, 1)));
     }
 }

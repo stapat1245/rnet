@@ -48,35 +48,78 @@ See [`plan.md`](plan.md) for the living implementation plan.
 
 ## Quick start
 
+Two people on **different home internet connections**. You run a small discovery
+server on a VPS/VM (TCP 9993 + UDP 9994). Overlay traffic is WireGuard; if NAT
+blocks direct UDP, the relay on the VPS forwards for those two peers.
+
+**Once, on the VPS**
+
+```bash
+# open TCP 9993 and UDP 9994 on the cloud firewall / UFW
+docker compose up -d
+```
+
+**Once, on each laptop** (the VPS public IP, not an overlay IP):
+
+```bash
+mkdir -p ~/.config/mynet
+cat > ~/.config/mynet/discovery.toml << EOF
+coordinator = "VPS_PUBLIC_IP:9993"
+relay = "VPS_PUBLIC_IP:9994"
+EOF
+cargo build --release -p mynet-cli
+sudo install -m 755 target/release/rnet /usr/local/bin/rnet
+```
+
+Person B only needs `rnet` installed; the secret carries the discovery address.
+
+**Person A**
+
+```bash
+sudo rnet start
+```
+
+Prints a secret and overlay `10.42.0.1`. Leave it running.
+
+**Person B** (any network)
+
+```bash
+sudo rnet connect rnet1.…
+```
+
+Gets `10.42.0.2`. Then `ping 10.42.0.1`. Direct WireGuard is tried first; after
+~15s with no handshake it fails over to the VPS relay. Ctrl-C stops the network.
+
+Advanced commands (`init`, `join`, manual peers) are still available as subcommands.
+
 ```bash
 cargo build
 cargo test
 cargo run -p mynet-cli -- --help
-cargo run -p mynet-cli -- version
 ```
 
 ```bash
-mynet --help
-mynet version
-mynet init
-mynet identity
-mynet peer add --public-key <base64> --ip 10.42.0.2 [--endpoint HOST:PORT] [--name bob]
-mynet peer list
-mynet peer remove bob
-mynet export --ip 10.42.0.1 --endpoint HOST:PORT
-mynet peer import alice.toml --name alice
-mynet join --coordinator VPS_IP:9993 --token TOKEN --ip 10.42.0.1
-mynet join --coordinator VPS_IP:9993 --token TOKEN --allocate
-mynet sync
-mynet status
-sudo mynet connect --ip 10.42.0.1
-sudo mynet connect --relay VPS_IP:9994
-sudo mynet disconnect
+rnet --help
+rnet version
+rnet init
+rnet identity
+rnet peer add --public-key <base64> --ip 10.42.0.2 [--endpoint HOST:PORT] [--name bob]
+rnet peer list
+rnet peer remove bob
+rnet export --ip 10.42.0.1 --endpoint HOST:PORT
+rnet peer import alice.toml --name alice
+rnet join --coordinator VPS_IP:9993 --token TOKEN --ip 10.42.0.1
+rnet join --coordinator VPS_IP:9993 --token TOKEN --allocate
+rnet sync
+rnet status
+sudo rnet connect --ip 10.42.0.1
+sudo rnet connect --relay VPS_IP:9994
+sudo rnet disconnect
 ```
 
 `mynet identity` prints the peer ID and public key. It never prints the private key.
 
-Config lives in `$MYNET_CONFIG_DIR` or `$XDG_CONFIG_HOME/mynet` (`identity.toml`, `peers.toml`, `local.toml`, mode `0600`).
+Config lives in `$MYNET_CONFIG_DIR` or `$XDG_CONFIG_HOME/mynet` (`identity.toml`, `peers.toml`, `local.toml`, mode `0600`). `sudo mynet connect` keeps the invoking user's config (`SUDO_USER`); it does not use `/root/.config/mynet`.
 
 To run the optional coordinator on a VPS, see [`execution.md`](execution.md). Short version: `.env` next to `docker-compose.yml` gets `MYNET_COORD_PORT` and `MYNET_JOIN_TOKEN`; laptops pass `VPS_IP:PORT` to `mynet join`.
 

@@ -314,7 +314,10 @@ struct FileOnDisk {
 
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
-    #[error("identity file not found at {}; run `mynet init`", .path.display())]
+    #[error(
+        "identity file not found at {}; run `mynet init` as the same user (plain `sudo` looks in /root/.config unless MYNET_CONFIG_DIR is set)",
+        .path.display()
+    )]
     NotFound { path: PathBuf },
     #[error(
         "identity file {} has insecure permissions {mode:#o}; expected {IDENTITY_FILE_MODE:#o}",

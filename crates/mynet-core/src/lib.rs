@@ -14,10 +14,12 @@
 
 use std::path::{Path, PathBuf};
 
+mod invite;
 mod local;
 mod peer;
 mod session;
 
+pub use invite::{Invite, InviteError, INVITE_PREFIX, INVITE_SYNC_SECS};
 pub use local::{split_host_port, LocalConfig, LocalError};
 pub use peer::{parse_endpoint, ApplyKind, Peer, PeerError, PeerList, PeerState};
 pub use session::{
@@ -64,17 +66,62 @@ pub const CONFIG_DIR_ENV: &str = "MYNET_CONFIG_DIR";
 ///
 /// Resolution order:
 /// 1. `MYNET_CONFIG_DIR` if set and non-empty
-/// 2. `$XDG_CONFIG_HOME/mynet` via `dirs::config_dir`
-/// 3. `./mynet` as a last resort
+/// 2. Invoking user's `~/.config/mynet` when running under `sudo` (`SUDO_USER`)
+/// 3. `$XDG_CONFIG_HOME/mynet` via `dirs::config_dir`
+/// 4. `./mynet` as a last resort
 pub fn config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var(CONFIG_DIR_ENV) {
         if !dir.is_empty() {
             return PathBuf::from(dir);
         }
     }
+    if let Some(dir) = sudo_user_config_dir() {
+        return dir;
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(APP_NAME)
+}
+
+fn euid_is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// `sudo mynet` must not look in `/root/.config/mynet` for identity created as a normal user.
+fn sudo_user_config_dir() -> Option<PathBuf> {
+    if !euid_is_root() {
+        return None;
+    }
+    let user = std::env::var("SUDO_USER").ok()?;
+    if user.is_empty() || user == "root" {
+        return None;
+    }
+    Some(home_dir_of(&user)?.join(".config").join(APP_NAME))
+}
+
+fn home_dir_of(user: &str) -> Option<PathBuf> {
+    let cname = std::ffi::CString::new(user).ok()?;
+    let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut buf = vec![0u8; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwnam_r(
+            cname.as_ptr(),
+            pwd.as_mut_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+    let dir = unsafe { std::ffi::CStr::from_ptr((*result).pw_dir) };
+    let s = dir.to_str().ok()?;
+    if s.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(s))
 }
 
 /// Path of the persistent identity file.
@@ -139,5 +186,19 @@ mod tests {
         std::env::set_var(CONFIG_DIR_ENV, "/tmp/mynet-test-config");
         assert_eq!(config_dir(), PathBuf::from("/tmp/mynet-test-config"));
         std::env::remove_var(CONFIG_DIR_ENV);
+    }
+
+    #[test]
+    fn config_dir_env_wins_over_sudo_user() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_sudo = std::env::var("SUDO_USER").ok();
+        std::env::set_var(CONFIG_DIR_ENV, "/tmp/mynet-test-config");
+        std::env::set_var("SUDO_USER", "nobody");
+        assert_eq!(config_dir(), PathBuf::from("/tmp/mynet-test-config"));
+        std::env::remove_var(CONFIG_DIR_ENV);
+        match prev_sudo {
+            Some(v) => std::env::set_var("SUDO_USER", v),
+            None => std::env::remove_var("SUDO_USER"),
+        }
     }
 }

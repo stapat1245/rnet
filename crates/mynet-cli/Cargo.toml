@@ -11,9 +11,14 @@ description = "Command-line interface for the mynet P2P VPN"
 name = "mynet"
 path = "src/main.rs"
 
+[[bin]]
+name = "rnet"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+getrandom = { workspace = true }
 libc = { workspace = true }
 mynet-core = { path = "../mynet-core" }
 mynet-identity = { path = "../mynet-identity" }

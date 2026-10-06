@@ -37,6 +37,7 @@ fn help_exits_zero_and_lists_version() {
     assert!(stdout.contains("identity"));
     assert!(stdout.contains("peer"));
     assert!(stdout.contains("connect"));
+    assert!(stdout.contains("start"));
     assert!(stdout.contains("tun-test"));
     assert!(stdout.contains("export"));
 }
@@ -306,6 +307,49 @@ fn help_lists_join_sync_status() {
     assert!(stdout.contains("join"));
     assert!(stdout.contains("sync"));
     assert!(stdout.contains("status"));
+    assert!(stdout.contains("start"));
+}
+
+#[test]
+fn connect_garbage_secret_fails_before_vpn() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_in(dir.path(), &["connect", "not-an-invite"]);
+    assert!(!out.status.success());
+    let err = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(
+        err.contains("invite") || err.contains("rnet1"),
+        "{err}"
+    );
+}
+
+#[test]
+fn start_help_mentions_other_machine() {
+    let output = Command::new(mynet_bin())
+        .args(["start", "--help"])
+        .output()
+        .expect("start help");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout = stdout(&output);
+    assert!(stdout.contains("secret") || stdout.contains("Ctrl-C") || stdout.contains("Start"));
+}
+
+#[test]
+fn start_without_root_explains_sudo() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_in(dir.path(), &["start"]);
+    if out.status.success() {
+        return;
+    }
+    let err = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(
+        err.contains("sudo")
+            || err.contains("root")
+            || err.contains("CAP_NET")
+            || err.contains("not permitted")
+            || err.contains("LAN")
+            || err.contains("discovery"),
+        "{err}"
+    );
 }
 
 #[test]

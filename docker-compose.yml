@@ -1,9 +1,10 @@
-# mynet coordinator (control plane only).
-# Overlay / WireGuard UDP does not go through this service.
+# mynet coordinator (control plane) + pair UDP relay (NAT fallback).
+# Overlay WireGuard is still peer-to-peer when NAT allows it.
+# The relay only forwards opaque UDP between exactly two peers.
 #
-# On the VPS, copy `.env.example` to `.env` and set MYNET_JOIN_TOKEN.
-# Publish TCP MYNET_COORD_PORT. Laptops use VPS_PUBLIC_IP:MYNET_COORD_PORT
-# with `mynet join --coordinator ...` — see execution.md.
+# On the VPS, copy `.env.example` to `.env`. Publish TCP 9993 and UDP 9994.
+# Laptops: put VPS_PUBLIC_IP:9993 in ~/.config/mynet/discovery.toml, then
+# `sudo rnet start` / `sudo rnet connect SECRET`.
 
 services:
   coordinator:
@@ -24,7 +25,6 @@ services:
       - coordinator-state:/var/lib/mynet
 
   relay:
-    profiles: ["relay"]
     build:
       context: .
       dockerfile: deploy/relay/Dockerfile

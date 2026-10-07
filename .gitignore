@@ -4,7 +4,7 @@
 .vscode/
 *.swp
 *~
-
+*pem
 # Local secrets — never commit identity or key material
 identity.toml
 *.key

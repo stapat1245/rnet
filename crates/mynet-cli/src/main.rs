@@ -340,6 +340,7 @@ fn cmd_start(dir: &Path, listen_port: u16, interface: String) -> Result<()> {
     tracing::info!(coordinator = %coordinator, "registering with public discovery server");
     let ip = coord::allocate_ip(&coordinator, &token, &identity.public_key().to_base64())?;
     tracing::info!(overlay = %ip, "assigned overlay IP");
+    reset_session_membership(dir)?;
     let report = coord::join(
         dir,
         coordinator.clone(),
@@ -361,7 +362,7 @@ fn cmd_start(dir: &Path, listen_port: u16, interface: String) -> Result<()> {
     let secret = invite.encode();
     let bin = invoked_as();
     let banner = format!(
-        "\nsecret    {secret}\noverlay   {ip}\niface     {interface}\n\nOn the other computer (anywhere on the internet):\n  {bin} connect {secret}\n\nCtrl-C stops the network.\n"
+        "\nsecret    {secret}\noverlay   {ip}\niface     {interface}\n\nOn the other computer (anywhere on the internet), whenever you are ready:\n  {bin} connect {secret}\n\nThis side waits until Ctrl-C.\n"
     );
 
     cmd_connect(
@@ -395,6 +396,7 @@ fn cmd_connect_invite(
     )?;
     tracing::info!(overlay = %ip, "assigned overlay IP");
     println!("overlay   {ip}");
+    reset_session_membership(dir)?;
     let report = coord::join(
         dir,
         coordinator.clone(),
@@ -766,16 +768,15 @@ fn cmd_connect_wireguard(
 
     let session_path = session_path_in(dir);
     let mut sessions = SessionTable::new();
+    let mut connecting_since: HashMap<String, Instant> = HashMap::new();
     for p in list.peers() {
-        let pk = p.public_key.to_base64();
-        let _ = sessions.apply(&pk, SessionEvent::Start, None);
-        if p.endpoint.is_some() {
-            let _ = sessions.apply(&pk, SessionEvent::EndpointKnown, p.endpoint);
-        } else if relay_addr.is_some() {
-            let _ = sessions.apply(&pk, SessionEvent::RelayReady, relay_addr);
-        } else {
-            let _ = sessions.apply(&pk, SessionEvent::NoEndpoint, None);
-        }
+        begin_peer_session(
+            &mut sessions,
+            &mut connecting_since,
+            &p.public_key.to_base64(),
+            p.endpoint,
+            relay_addr,
+        );
     }
     let _ = sessions.save_to(&session_path);
 
@@ -785,9 +786,8 @@ fn cmd_connect_wireguard(
     );
     install_stop_handler();
     let mut last_sync = Instant::now();
-    let connecting_since = Instant::now();
     let mut last_src = primary_ipv4();
-    let mut failed_over = false;
+    let handshake_timeout = Duration::from_secs(HANDSHAKE_TIMEOUT_SECS);
     while !STOP.load(Ordering::Relaxed) {
         if let Ok(handshakes) = wg_latest_handshakes(&cfg.interface) {
             for (pk, ts) in handshakes {
@@ -796,45 +796,19 @@ fn cmd_connect_wireguard(
                     let _ = sessions.apply(&pk, SessionEvent::HandshakeOk, None);
                     if before == Some(PeerState::Connecting) {
                         tracing::info!(peer = %pk, "peer handshake ok");
+                        connecting_since.remove(&pk);
                     }
                 }
             }
         }
-        if !failed_over && connecting_since.elapsed() >= Duration::from_secs(HANDSHAKE_TIMEOUT_SECS) {
-            let still_connecting = sessions.rows().any(|r| r.state == PeerState::Connecting);
-            if still_connecting {
-                if let Some(relay) = relay_addr {
-                    tracing::warn!(%relay, "direct handshake timed out; failing over to pair relay");
-                    for p in list.peers() {
-                        let pk = p.public_key.to_base64();
-                        if sessions.get(&pk).map(|r| r.state) == Some(PeerState::Connecting) {
-                            let _ = sessions.apply(&pk, SessionEvent::RelayReady, Some(relay));
-                            let wg = WgPeer {
-                                public_key_base64: pk,
-                                endpoint: Some(relay),
-                                allowed_ip: p.virtual_ip,
-                            };
-                            if let Err(e) = upsert_wg_peer(&cfg.interface, &wg) {
-                                tracing::warn!(error = %e, "relay endpoint update failed");
-                                let _ = sessions.apply(
-                                    &p.public_key.to_base64(),
-                                    SessionEvent::RelayFail,
-                                    None,
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    for p in list.peers() {
-                        let pk = p.public_key.to_base64();
-                        if sessions.get(&pk).map(|r| r.state) == Some(PeerState::Connecting) {
-                            let _ = sessions.apply(&pk, SessionEvent::HandshakeTimeout, None);
-                        }
-                    }
-                }
-            }
-            failed_over = true;
-        }
+        failover_connecting_peers(
+            &mut sessions,
+            &mut connecting_since,
+            dir,
+            &cfg.interface,
+            relay_addr,
+            handshake_timeout,
+        )?;
         let src_changed = {
             let now = primary_ipv4();
             let changed = now.is_some() && now != last_src;
@@ -856,18 +830,18 @@ fn cmd_connect_wireguard(
                             updated = report.updated,
                             "applying coordinator endpoint updates"
                         );
-                        if !failed_over || relay_addr.is_none() {
-                            apply_live_peers(dir, &cfg.interface)?;
-                            let list = PeerList::load_from(&peers_path_in(dir))?;
-                            for p in list.peers() {
-                                if let Some(ep) = p.endpoint {
-                                    let _ = sessions.apply(
-                                        &p.public_key.to_base64(),
-                                        SessionEvent::EndpointKnown,
-                                        Some(ep),
-                                    );
-                                }
-                            }
+                        // Always take new peers. Do not rewrite endpoints for
+                        // peers already on the pair relay.
+                        apply_live_peers(dir, &cfg.interface, &sessions)?;
+                        let list = PeerList::load_from(&peers_path_in(dir))?;
+                        for p in list.peers() {
+                            begin_peer_session(
+                                &mut sessions,
+                                &mut connecting_since,
+                                &p.public_key.to_base64(),
+                                p.endpoint,
+                                relay_addr,
+                            );
                         }
                     }
                 }
@@ -886,6 +860,94 @@ fn cmd_connect_wireguard(
     Ok(())
 }
 
+fn reset_session_membership(dir: &Path) -> Result<()> {
+    PeerList::new()
+        .save_to(&peers_path_in(dir))
+        .context("reset peers.toml for a new session")?;
+    let _ = SessionTable::remove_file(&session_path_in(dir));
+    Ok(())
+}
+
+fn begin_peer_session(
+    sessions: &mut SessionTable,
+    connecting_since: &mut HashMap<String, Instant>,
+    pk: &str,
+    endpoint: Option<SocketAddr>,
+    relay_addr: Option<SocketAddr>,
+) {
+    if sessions.get(pk).is_some() {
+        return;
+    }
+    let _ = sessions.apply(pk, SessionEvent::Start, None);
+    if endpoint.is_some() {
+        let _ = sessions.apply(pk, SessionEvent::EndpointKnown, endpoint);
+        connecting_since.insert(pk.to_string(), Instant::now());
+    } else if relay_addr.is_some() {
+        let _ = sessions.apply(pk, SessionEvent::RelayReady, relay_addr);
+    } else {
+        let _ = sessions.apply(pk, SessionEvent::NoEndpoint, None);
+    }
+}
+
+fn failover_connecting_peers(
+    sessions: &mut SessionTable,
+    connecting_since: &mut HashMap<String, Instant>,
+    dir: &Path,
+    iface: &str,
+    relay_addr: Option<SocketAddr>,
+    timeout: Duration,
+) -> Result<()> {
+    let due: Vec<String> = sessions
+        .rows()
+        .filter(|r| r.state == PeerState::Connecting)
+        .filter(|r| {
+            connecting_since
+                .get(&r.public_key)
+                .map(|started| started.elapsed() >= timeout)
+                .unwrap_or(false)
+        })
+        .map(|r| r.public_key.clone())
+        .collect();
+    if due.is_empty() {
+        return Ok(());
+    }
+    let list = PeerList::load_from(&peers_path_in(dir))?;
+    if let Some(relay) = relay_addr {
+        tracing::warn!(
+            %relay,
+            n = due.len(),
+            "direct handshake timed out; failing over to pair relay"
+        );
+        for pk in due {
+            let allowed_ip = match list
+                .peers()
+                .iter()
+                .find(|p| p.public_key.to_base64() == pk)
+            {
+                Some(p) => p.virtual_ip,
+                None => continue,
+            };
+            let _ = sessions.apply(&pk, SessionEvent::RelayReady, Some(relay));
+            connecting_since.remove(&pk);
+            let wg = WgPeer {
+                public_key_base64: pk.clone(),
+                endpoint: Some(relay),
+                allowed_ip,
+            };
+            if let Err(e) = upsert_wg_peer(iface, &wg) {
+                tracing::warn!(error = %e, "relay endpoint update failed");
+                let _ = sessions.apply(&pk, SessionEvent::RelayFail, None);
+            }
+        }
+    } else {
+        for pk in due {
+            let _ = sessions.apply(&pk, SessionEvent::HandshakeTimeout, None);
+            connecting_since.remove(&pk);
+        }
+    }
+    Ok(())
+}
+
 fn resolve_host_port(s: &str) -> Result<SocketAddr> {
     let (host, port) = mynet_core::split_host_port(s)?;
     use std::net::ToSocketAddrs;
@@ -896,11 +958,15 @@ fn resolve_host_port(s: &str) -> Result<SocketAddr> {
         .with_context(|| format!("no IPv4 address for {s}"))
 }
 
-fn apply_live_peers(dir: &Path, iface: &str) -> Result<()> {
+fn apply_live_peers(dir: &Path, iface: &str, sessions: &SessionTable) -> Result<()> {
     let list = PeerList::load_from(&peers_path_in(dir))?;
     for p in list.peers() {
+        let pk = p.public_key.to_base64();
+        if sessions.get(&pk).map(|r| r.state) == Some(PeerState::Relaying) {
+            continue;
+        }
         let peer = WgPeer {
-            public_key_base64: p.public_key.to_base64(),
+            public_key_base64: pk,
             endpoint: p.endpoint,
             allowed_ip: p.virtual_ip,
         };

@@ -168,7 +168,7 @@ impl Registry {
                 Err(e) => ControlResponse::error(e.to_string()),
             },
             KIND_DISCOVER => ControlResponse::ok(self.advertise(&req.token)),
-            KIND_ALLOCATE => match self.next_free_ip(&req.token) {
+            KIND_ALLOCATE => match self.allocate_for(&req.token, &req.public_key) {
                 Some(ip) => ControlResponse::allocated(ip.to_string()),
                 None => ControlResponse::error("overlay address pool exhausted"),
             },
@@ -234,6 +234,19 @@ impl Registry {
         }
         self.persist()?;
         Ok(())
+    }
+
+    /// Same public key in the same room always gets the same overlay IP, so
+    /// `rnet connect` after Ctrl-C does not allocate a new address and then
+    /// fail registration.
+    pub fn allocate_for(&self, token: &str, public_key: &str) -> Option<Ipv4Addr> {
+        let pk = PublicKey::from_base64(public_key)
+            .map(|k| k.to_base64())
+            .unwrap_or_else(|_| public_key.to_string());
+        if let Some(existing) = self.room(token).and_then(|r| r.get(&pk)) {
+            return Some(existing.virtual_ip);
+        }
+        self.next_free_ip(token)
     }
 
     pub fn next_free_ip(&self, token: &str) -> Option<Ipv4Addr> {
@@ -510,6 +523,54 @@ mod tests {
             "127.0.0.1:9".parse().unwrap(),
         );
         assert_eq!(resp.assigned_ip.as_deref(), Some("10.42.0.2"));
+    }
+
+    #[test]
+    fn allocate_reuses_ip_when_the_same_key_reconnects() {
+        let mut reg = Registry::new(CoordinatorConfig {
+            join_token: String::new(),
+            network: "lab".into(),
+            state_path: None,
+        });
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let alice_pk = alice.public_key().to_base64();
+        let bob_pk = bob.public_key().to_base64();
+        let a = ControlRequest::register(
+            "",
+            &alice_pk,
+            "10.42.0.1",
+            51820,
+            Some("192.0.2.10:51820".into()),
+        );
+        let b = ControlRequest::register(
+            "",
+            &bob_pk,
+            "10.42.0.2",
+            51820,
+            Some("198.51.100.20:51820".into()),
+        );
+        assert!(reg.handle(&a, "127.0.0.1:9".parse().unwrap()).is_ok());
+        assert!(reg.handle(&b, "127.0.0.1:9".parse().unwrap()).is_ok());
+
+        let again = reg.handle(
+            &ControlRequest::allocate("", &bob_pk),
+            "127.0.0.1:9".parse().unwrap(),
+        );
+        assert!(again.is_ok(), "{again:?}");
+        assert_eq!(again.assigned_ip.as_deref(), Some("10.42.0.2"));
+
+        let rejoin = ControlRequest::register(
+            "",
+            &bob_pk,
+            "10.42.0.2",
+            51820,
+            Some("198.51.100.20:51820".into()),
+        );
+        let resp = reg.handle(&rejoin, "127.0.0.1:9".parse().unwrap());
+        assert!(resp.is_ok(), "{resp:?}");
+        let bob_rec = resp.peers.iter().find(|p| p.public_key == bob_pk).unwrap();
+        assert_eq!(bob_rec.virtual_ip, "10.42.0.2");
     }
 
     #[test]

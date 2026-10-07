@@ -355,4 +355,16 @@ mod tests {
         SessionTable::remove_file(&path).unwrap();
         assert!(SessionTable::load_from(&path).unwrap().get("pkA").is_none());
     }
+
+    #[test]
+    fn late_peer_can_connect_after_idle_table() {
+        let mut table = SessionTable::new();
+        assert!(table.rows().next().is_none());
+        assert_eq!(table.apply("pkB", Start, None).unwrap(), Discovering);
+        assert_eq!(
+            table.apply("pkB", EndpointKnown, Some("192.0.2.20:51820".parse().unwrap())).unwrap(),
+            Connecting
+        );
+        assert_eq!(table.apply("pkB", RelayReady, None).unwrap(), Relaying);
+    }
 }

@@ -1,65 +1,48 @@
-# mynet
+# rnet
 
-A learning-focused but properly engineered **peer-to-peer VPN** in Rust.
+A small Linux VPN. One machine starts a network and prints a secret; the other joins with that secret. Both get overlay IPs on `10.42.0.0/24` (`mynet0`). Traffic is kernel WireGuard.
 
-mynet is not a Tailscale clone. It is a small, understandable Linux VPN built from first principles, using mature cryptographic and networking primitives instead of inventing cryptography.
+Works across different home networks. A VPS is used only for discovery and, if NAT blocks direct UDP, a two-peer relay.
 
-## What it does (target)
+## Architecture
 
-* Each computer has a cryptographic identity (X25519, WireGuard-compatible).
-* Two computers authenticate each other using public keys.
-* Each computer gets a virtual private IPv4 address.
-* Applications communicate over those private IPs.
-* Traffic between peers is encrypted with **kernel WireGuard**.
-* Peers communicate directly over UDP whenever possible.
-* A coordination server, if present, is for discovery only. It is never the VPN data path.
-* A relay may be used as a fallback when direct P2P is impossible (`mynet-relay`, two peers).
+```text
+Person A  <-- WireGuard UDP -->  Person B
+    |                               |
+    +------ TCP 9993 (discovery) ---+
+    +------ UDP 9994 (relay) -------+
+                    |
+                   VPS
+```
 
-## Status
+- **Identity** is an X25519 public key (WireGuard-compatible), not an IP.
+- **Coordinator** (TCP 9993) assigns overlay IPs and tells each side the other’s public key and endpoint. It never sees VPN packets.
+- **Data path** is kernel WireGuard. Direct UDP is tried first; after 15s with no handshake, both sides fail over to the VPS relay (UDP 9994).
 
-See [`plan.md`](plan.md) for the living implementation plan.
+## Install
 
-| Phase | Name | Status |
-| --- | --- | --- |
-| 0 | Architecture and repository setup | COMPLETE |
-| 1 | Identity | COMPLETE |
-| 2 | Peer model | COMPLETE |
-| 3 | TUN interface | IMPLEMENTED (needs sudo to verify) |
-| 4 | Two-host TUN+UDP | IMPLEMENTED (`--plain`, needs sudo) |
-| 5 | Kernel WireGuard | IMPLEMENTED (`mynet connect`, needs sudo) |
-| 6 | Manual peer exchange | COMPLETE (`export` / `peer import`) |
-| 7 | Identity association | IMPLEMENTED (unknown keys / IP mismatch rejected) |
-| 8 | Coordinator | IMPLEMENTED (`mynet-coordinator`, Docker; control plane only) |
-| 9 | Endpoint discovery | IMPLEMENTED (`join` / `sync`; live WG reconnect not verified) |
-| 10 | NAT / hole punch | IMPLEMENTED (`mynet-natpunch`; two real NATs not tested) |
-| 11 | Session state machine | IMPLEMENTED (`session.toml`; live handshake not verified) |
-| 12 | Keepalives | IMPLEMENTED (WG 25s + coordinator sync 30s) |
-| 13 | Pair UDP relay | IMPLEMENTED (`mynet-relay`; live failover not run) |
-| 14 | Overlay addresses | IMPLEMENTED (`--ip` or `join --allocate`) |
-| 15 | Host overlay route | IMPLEMENTED (`10.42.0.0/24 dev mynet0`) |
-| 16 | Operator CLI | IMPLEMENTED (`status` shows per-peer state) |
+**Linux**, `rustc` 1.75+, `wireguard-tools`, and root (`sudo`) on each laptop. Open **TCP 9993** and **UDP 9994** on the VPS firewall.
 
-## Requirements
-
-* Linux (first and currently only target)
-* Rust 1.75+ (this repository is pinned to compile on Ubuntu 24.04's `rustc 1.75.0`)
-* Root / `CAP_NET_ADMIN` for TUN and WireGuard interface configuration (later phases)
-* Kernel WireGuard (`wireguard` module) and `wireguard-tools` for encrypted transport (Phase 5)
-
-## Quick start
-
-Two people on **different home internet connections**. You run a small discovery
-server on a VPS/VM (TCP 9993 + UDP 9994). Overlay traffic is WireGuard; if NAT
-blocks direct UDP, the relay on the VPS forwards for those two peers.
-
-**Once, on the VPS**
+### VPS (once)
 
 ```bash
-# open TCP 9993 and UDP 9994 on the cloud firewall / UFW
+git clone https://github.com/stapat1245/rnet.git
+cd rnet
+cp .env.example .env
 docker compose up -d
 ```
 
-**Once, on each laptop** (the VPS public IP, not an overlay IP):
+### Laptops
+
+```bash
+sudo apt install wireguard-tools
+git clone https://github.com/stapat1245/rnet.git
+cd rnet
+cargo build --release -p mynet-cli
+sudo install -m 755 target/release/rnet /usr/local/bin/rnet
+```
+
+Person A also needs the VPS address (Person B does not; the secret carries it):
 
 ```bash
 mkdir -p ~/.config/mynet
@@ -67,90 +50,27 @@ cat > ~/.config/mynet/discovery.toml << EOF
 coordinator = "VPS_PUBLIC_IP:9993"
 relay = "VPS_PUBLIC_IP:9994"
 EOF
-cargo build --release -p mynet-cli
-sudo install -m 755 target/release/rnet /usr/local/bin/rnet
 ```
 
-Person B only needs `rnet` installed; the secret carries the discovery address.
+## Use
 
-**Person A**
+Person A:
 
 ```bash
 sudo rnet start
 ```
 
-Prints a secret and overlay `10.42.0.1`. Leave it running.
+Leave it running. It prints a secret and `10.42.0.1`.
 
-**Person B** (any network)
+Person B, any time while A is still up:
 
 ```bash
 sudo rnet connect rnet1.…
 ```
 
-Gets `10.42.0.2`. Then `ping 10.42.0.1`. Direct WireGuard is tried first; after
-~15s with no handshake it fails over to the VPS relay. Ctrl-C stops the network.
+Gets `10.42.0.2`. Then `ping 10.42.0.1`. Ctrl-C (or `sudo rnet disconnect`) stops the network.
 
-Advanced commands (`init`, `join`, manual peers) are still available as subcommands.
-
-```bash
-cargo build
-cargo test
-cargo run -p mynet-cli -- --help
-```
-
-```bash
-rnet --help
-rnet version
-rnet init
-rnet identity
-rnet peer add --public-key <base64> --ip 10.42.0.2 [--endpoint HOST:PORT] [--name bob]
-rnet peer list
-rnet peer remove bob
-rnet export --ip 10.42.0.1 --endpoint HOST:PORT
-rnet peer import alice.toml --name alice
-rnet join --coordinator VPS_IP:9993 --token TOKEN --ip 10.42.0.1
-rnet join --coordinator VPS_IP:9993 --token TOKEN --allocate
-rnet sync
-rnet status
-sudo rnet connect --ip 10.42.0.1
-sudo rnet connect --relay VPS_IP:9994
-sudo rnet disconnect
-```
-
-`mynet identity` prints the peer ID and public key. It never prints the private key.
-
-Config lives in `$MYNET_CONFIG_DIR` or `$XDG_CONFIG_HOME/mynet` (`identity.toml`, `peers.toml`, `local.toml`, mode `0600`). `sudo mynet connect` keeps the invoking user's config (`SUDO_USER`); it does not use `/root/.config/mynet`.
-
-To run the optional coordinator on a VPS, see [`execution.md`](execution.md). Short version: `.env` next to `docker-compose.yml` gets `MYNET_COORD_PORT` and `MYNET_JOIN_TOKEN`; laptops pass `VPS_IP:PORT` to `mynet join`.
-
-## Architecture in one picture
-
-```text
-            CONTROL PLANE
-                  |
-       +----------+----------+
-       |                     |
-Coordinator               Peer metadata
-(discovery only)          (identity, endpoints)
-       |                     |
-       +----------+----------+
-                  |
-                  v
-
-              DATA PLANE
-
-Alice ========================== Bob
-        kernel WireGuard over UDP
-```
-
-Identity is a public key. An IP address or UDP endpoint is never identity.
-
-## Documentation
-
-* [`plan.md`](plan.md) — phases, exit criteria, current status
-* [`notes.md`](notes.md) — architecture decisions, Linux notes, commands, experiments
-* [`execution.md`](execution.md) — what to run on a VPS vs laptops, Docker, where IP/port go
-* [`test.md`](test.md) — Alice / Bob / VPS hands-on test checklist
+Config lives in `~/.config/mynet` even under `sudo`.
 
 ## License
 

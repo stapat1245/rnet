@@ -23,7 +23,15 @@ Person A  <-- WireGuard UDP -->  Person B
 
 **Linux**, `rustc` 1.75+, `wireguard-tools`, and root (`sudo`) on each laptop. Open **TCP 9993** and **UDP 9994** on the VPS firewall.
 
-### VPS (once)
+
+
+### Users
+
+```bash
+curl -fsSL https://rnet.stapat.xyz/install.sh | bash
+```
+
+### VPS (once default server is running :()
 
 ```bash
 git clone https://github.com/stapat1245/rnet.git
@@ -31,27 +39,6 @@ cd rnet
 cp .env.example .env
 docker compose up -d
 ```
-
-### Laptops
-
-```bash
-sudo apt install wireguard-tools
-git clone https://github.com/stapat1245/rnet.git
-cd rnet
-cargo build --release -p mynet-cli
-sudo install -m 755 target/release/rnet /usr/local/bin/rnet
-```
-
-Person A also needs the VPS address (Person B does not; the secret carries it):
-
-```bash
-mkdir -p ~/.config/mynet
-cat > ~/.config/mynet/discovery.toml << EOF
-coordinator = "VPS_PUBLIC_IP:9993"
-relay = "VPS_PUBLIC_IP:9994"
-EOF
-```
-
 ## Use
 
 Person A:
@@ -71,7 +58,3 @@ sudo rnet connect rnet1.…
 Gets `10.42.0.2`. Then `ping 10.42.0.1`. Ctrl-C (or `sudo rnet disconnect`) stops the network.
 
 Config lives in `~/.config/mynet` even under `sudo`.
-
-## License
-
-MIT

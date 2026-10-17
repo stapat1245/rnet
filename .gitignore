@@ -5,7 +5,10 @@
 *.swp
 *~
 *pem
-# Local secrets — never commit identity or key material
+
+notes.md
+execution.md
+
 identity.toml
 *.key
 .env

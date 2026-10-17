@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>rnet</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #070806;
+      --ink: #e8dcc0;
+      --dim: #8a7e64;
+      --amber: #e6b84d;
+      --amber-dim: #9a7420;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "VT323", monospace;
+    }
+
+    canvas#bg {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      z-index: 0;
+    }
+
+    .scan {
+      position: fixed;
+      inset: 0;
+      z-index: 1;
+      pointer-events: none;
+      background: repeating-linear-gradient(
+        to bottom,
+        rgba(0, 0, 0, 0.18) 0px,
+        rgba(0, 0, 0, 0.18) 1px,
+        transparent 1px,
+        transparent 3px
+      );
+    }
+
+    .frame {
+      position: relative;
+      z-index: 2;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .mark {
+      position: absolute;
+      top: 28px;
+      left: 32px;
+      font-family: "Press Start 2P", monospace;
+      font-size: 11px;
+      letter-spacing: 2px;
+      color: var(--amber);
+      text-shadow: 2px 2px 0 #3a2a08;
+    }
+
+    h1 {
+      font-family: "Press Start 2P", monospace;
+      font-size: clamp(22px, 4.2vw, 42px);
+      line-height: 1.45;
+      text-align: center;
+      max-width: 16ch;
+      color: var(--ink);
+      text-shadow: 3px 3px 0 #1a160c, 0 0 24px rgba(230, 184, 77, 0.18);
+    }
+
+    .sub {
+      margin-top: 18px;
+      font-size: 26px;
+      letter-spacing: 1px;
+      color: var(--dim);
+      text-align: center;
+    }
+
+    .install {
+      margin-top: 40px;
+      display: flex;
+      align-items: stretch;
+      max-width: min(920px, 92vw);
+      border: 3px solid var(--amber-dim);
+      background: rgba(8, 8, 6, 0.72);
+      box-shadow: 6px 6px 0 #1c1506;
+    }
+
+    .prompt {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 16px;
+      overflow: hidden;
+      font-size: clamp(18px, 2.2vw, 26px);
+      white-space: nowrap;
+    }
+
+    .dollar {
+      color: var(--amber);
+      flex-shrink: 0;
+    }
+
+    code {
+      font-family: "VT323", monospace;
+      color: var(--ink);
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    button {
+      font-family: "Press Start 2P", monospace;
+      font-size: 9px;
+      letter-spacing: 1px;
+      border: none;
+      border-left: 3px solid var(--amber-dim);
+      background: #1a160c;
+      color: var(--amber);
+      padding: 0 18px;
+      cursor: pointer;
+      image-rendering: pixelated;
+    }
+
+    button:hover { background: #2a220f; }
+    button:active { transform: translate(1px, 1px); }
+
+    .cmds {
+      margin-top: 18px;
+      display: flex;
+      gap: 14px;
+      max-width: min(920px, 92vw);
+      width: 100%;
+    }
+
+    .box {
+      flex: 1;
+      min-width: 0;
+      border: 3px solid var(--amber-dim);
+      background: rgba(8, 8, 6, 0.72);
+      box-shadow: 4px 4px 0 #1c1506;
+      padding: 10px 14px;
+    }
+
+    .box .who {
+      font-family: "Press Start 2P", monospace;
+      font-size: 8px;
+      letter-spacing: 1px;
+      color: var(--amber);
+      margin-bottom: 6px;
+    }
+
+    .box .line {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 22px;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+
+    .box code { color: var(--ink); }
+
+    .meta {
+      position: absolute;
+      bottom: 28px;
+      font-size: 20px;
+      letter-spacing: 2px;
+      color: var(--dim);
+    }
+  </style>
+</head>
+<body>
+  <canvas id="bg" aria-hidden="true"></canvas>
+  <div class="scan"></div>
+  <div class="frame">
+    <div class="mark">rnet</div>
+    <h1>two machines on a secret</h1>
+    <p class="sub">a good peer2peer vpn · built on wireguard</p>
+    <div class="install">
+      <div class="prompt">
+        <span class="dollar">$</span>
+        <code id="cmd">curl -fsSL https://rnet.stapat.xyz/install.sh | bash</code>
+      </div>
+      <button type="button" data-copy>COPY</button>
+    </div>
+    <div class="cmds">
+      <div class="box">
+        <div class="who">A</div>
+        <div class="line"><span class="dollar">$</span><code>sudo rnet start</code></div>
+      </div>
+      <div class="box">
+        <div class="who">B</div>
+        <div class="line"><span class="dollar">$</span><code>sudo rnet connect &lt;secret&gt;</code></div>
+      </div>
+    </div>
+    <p class="meta">10.42.0.0/24</p>
+  </div>
+  <script>
+    document.querySelector("[data-copy]").addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      try {
+        await navigator.clipboard.writeText(document.getElementById("cmd").textContent);
+        btn.textContent = "OK";
+      } catch {
+        btn.textContent = "ERR";
+      }
+      setTimeout(() => { btn.textContent = "COPY"; }, 1200);
+    });
+
+    const canvas = document.getElementById("bg");
+    const ctx = canvas.getContext("2d");
+    const PX = 8;
+    const pal = [
+      [7, 8, 6],
+      [14, 16, 10],
+      [28, 26, 12],
+      [48, 38, 10],
+      [90, 64, 16],
+      [160, 118, 36],
+    ];
+
+    let cols = 0, rows = 0, buf, img, off, offCtx;
+
+    function resize() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      cols = Math.ceil(canvas.width / PX);
+      rows = Math.ceil(canvas.height / PX);
+      buf = new Uint8Array(cols * rows);
+      img = ctx.createImageData(cols, rows);
+      off = document.createElement("canvas");
+      off.width = cols;
+      off.height = rows;
+      offCtx = off.getContext("2d");
+    }
+
+    function hash(x, y) {
+      let n = (x * 374761393 + y * 668265263) | 0;
+      n = (n ^ (n >>> 13)) * 1274126177;
+      return ((n ^ (n >>> 16)) >>> 0) / 4294967295;
+    }
+
+    function tick(t) {
+      const time = t * 0.00035;
+      for (let y = 0; y < rows; y++) {
+        for (let x = 0; x < cols; x++) {
+          const n =
+            Math.sin(x * 0.11 + time * 1.4) +
+            Math.sin(y * 0.09 - time * 1.1) +
+            Math.sin((x + y) * 0.07 + time * 0.8);
+          const spark = hash(x, y + ((t / 180) | 0)) > 0.992 ? 2 : 0;
+          let v = Math.floor(((n + 3) / 6) * 4) + spark;
+          if (v < 0) v = 0;
+          if (v > 5) v = 5;
+          buf[y * cols + x] = v;
+        }
+      }
+
+      const d = img.data;
+      for (let i = 0; i < buf.length; i++) {
+        const c = pal[buf[i]];
+        const o = i * 4;
+        d[o] = c[0];
+        d[o + 1] = c[1];
+        d[o + 2] = c[2];
+        d[o + 3] = 255;
+      }
+      offCtx.putImageData(img, 0, 0);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(off, 0, 0, canvas.width, canvas.height);
+      requestAnimationFrame(tick);
+    }
+
+    window.addEventListener("resize", resize);
+    resize();
+    requestAnimationFrame(tick);
+  </script>
+</body>
+</html>

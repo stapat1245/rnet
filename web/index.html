@@ -175,6 +175,38 @@
 
     .box code { color: var(--ink); }
 
+    .chat {
+      margin-top: 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      max-width: min(920px, 92vw);
+      width: 100%;
+      border: 3px solid var(--amber-dim);
+      background: rgba(8, 8, 6, 0.72);
+      box-shadow: 4px 4px 0 #1c1506;
+      padding: 10px 14px;
+      overflow: hidden;
+    }
+
+    .chat .tag {
+      font-family: "Press Start 2P", monospace;
+      font-size: 8px;
+      letter-spacing: 1px;
+      color: var(--amber);
+      flex-shrink: 0;
+    }
+
+    .chat code { color: var(--ink); font-size: 22px; flex-shrink: 0; }
+
+    .chat .note {
+      color: var(--dim);
+      font-size: 18px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
     .meta {
       position: absolute;
       bottom: 28px;
@@ -207,6 +239,11 @@
         <div class="who">B</div>
         <div class="line"><span class="dollar">$</span><code>sudo rnet connect &lt;secret&gt;</code></div>
       </div>
+    </div>
+    <div class="chat">
+      <span class="tag">+ RCHAT</span>
+      <span class="dollar">$</span><code>rchat</code>
+      <span class="note"> &middot; p2p terminal chat over the vpn network &middot;</span>
     </div>
     <p class="meta">10.42.0.0/24</p>
   </div>

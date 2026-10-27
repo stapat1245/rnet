@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Replace with your VPS public IP address
-VPS_PUBLIC_IP="172.197.216.135"
+VPS_PUBLIC_IP="20.244.105.30"
 
 
 RCHAT_REPO="https://github.com/stapat1245/rchat.git"
